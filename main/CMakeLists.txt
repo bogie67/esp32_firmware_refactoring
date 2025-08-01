@@ -1,10 +1,13 @@
 
 idf_component_register(
-    SRCS  "app_main.c"
-          "codec.c"
-          "transport_ble.c"
-          "cmd_proc_task.c"
-          "schedule.c"
-    REQUIRES bt json 
-    PRIV_REQUIRES nvs_flash
+    SRCS "app_main.c"
+         "cmd_proc_task.c"
+         "codec.c"
+         "schedule.c"
+         "transport_ble.c"
+         "transport_mqtt.c"
+         "wifi.c"
+         "test_wifi_simple.c"
+    INCLUDE_DIRS "."
+    REQUIRES bt esp_wifi json freertos nvs_flash unity
 )

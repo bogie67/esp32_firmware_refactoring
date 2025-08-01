@@ -34,6 +34,10 @@ static const ble_uuid16_t tx_uuid  = BLE_UUID16_INIT(0xFF02);
 static uint16_t rx_handle;          /* valore scritto da NimBLE */
 static uint16_t tx_handle;          /* valore scritto da NimBLE */
 
+static uint16_t current_conn = BLE_HS_CONN_HANDLE_NONE;
+
+
+
 /* ──────────────── GATT callbacks ──────────────── */
 static int gatt_chr_access_cb(uint16_t conn_h, uint16_t attr_h,
                               struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -132,20 +136,22 @@ static void advertise_start(void);
 static int gap_evt_cb(struct ble_gap_event *ev, void *arg)
 {
     switch (ev->type) {
-        case BLE_GAP_EVENT_CONNECT:
-            if (ev->connect.status != 0) {
-                ESP_LOGW("BLE_NIMBLE", "Connessione fallita, status=%d", ev->connect.status);
-                advertise_start();
-            } else {
-                ESP_LOGI("BLE_NIMBLE", "Client connesso!");
-            }
-            break;
-        case BLE_GAP_EVENT_DISCONNECT:
-            ESP_LOGI("BLE_NIMBLE", "Client disconnesso");
+    case BLE_GAP_EVENT_CONNECT:
+        if (ev->connect.status == 0) {
+            current_conn = ev->connect.conn_handle;
+            ESP_LOGI("BLE_NIMBLE", "Client connesso!");
+        } else {
             advertise_start();
-            break;
-        default:
-            break;
+        }
+        break;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        current_conn = BLE_HS_CONN_HANDLE_NONE;
+        advertise_start();
+        break;
+
+    default:
+        break;
     }
     return 0;
 }
@@ -169,13 +175,30 @@ static void advertise_start(void)
 /* ──────────────── TX task ──────────────── */
 static void notify_resp(const resp_frame_t *r)
 {
+    if (current_conn == BLE_HS_CONN_HANDLE_NONE) {
+        ESP_LOGW("BLE_NIMBLE", "❌ No client connected - skipping notify");
+        return;
+    }
+
     size_t len;
     uint8_t *buf = encode_ble_resp(r, &len);
-    if (!buf) return;
+    if (!buf) {
+        ESP_LOGE("BLE_NIMBLE", "❌ Failed to encode response");
+        return;
+    }
+
+    ESP_LOGI("BLE_NIMBLE", "📤 Sending notify: conn=%d, handle=%d, len=%zu", 
+             current_conn, tx_handle, len);
 
     struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
     free(buf);
-    ble_gattc_notify_custom(BLE_HS_CONN_HANDLE_NONE, tx_handle, om);
+    int rc = ble_gattc_notify_custom(current_conn, tx_handle, om);
+    
+    if (rc == 0) {
+        ESP_LOGI("BLE_NIMBLE", "✅ Notifica inviata con successo");
+    } else {
+        ESP_LOGE("BLE_NIMBLE", "❌ Errore invio notifica: %d", rc);
+    }
 }
 
 static void tx_task(void *arg)

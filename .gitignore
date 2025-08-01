@@ -2,3 +2,4 @@ build/
 .DS_Store
 *.zip
 .claude/
+# VSCode configurations are included for better DX.tmp.driveupload/
