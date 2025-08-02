@@ -22,9 +22,22 @@
 
 #define DEVICE_NAME "SMART_DRIP"
 
-/* ──────────────── Queue handles ──────────────── */
-static QueueHandle_t cmdQ  = NULL;
-static QueueHandle_t respQ = NULL;
+/* ──────────────── State management ──────────────── */
+static ble_state_t ble_state = BLE_DOWN;
+static QueueHandle_t cmd_queue = NULL;
+static QueueHandle_t resp_queue = NULL;
+
+/* ──────────────── Connection tracking ──────────────── */
+static uint16_t current_conn = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t negotiated_mtu = 23;  // Default BLE ATT MTU
+static TaskHandle_t tx_task_handle = NULL;
+
+/* ──────────────── Chunking configuration ──────────────── */
+static ble_chunk_config_t chunk_config = {
+    .max_chunk_size = 20,      // Will be updated after MTU negotiation
+    .max_concurrent = 4,
+    .reassembly_timeout_ms = 2000
+};
 
 #if CONFIG_MAIN_WITH_BLE
 
@@ -35,8 +48,6 @@ static const ble_uuid16_t tx_uuid  = BLE_UUID16_INIT(0xFF02);
 
 static uint16_t rx_handle;          /* valore scritto da NimBLE */
 static uint16_t tx_handle;          /* valore scritto da NimBLE */
-
-static uint16_t current_conn = BLE_HS_CONN_HANDLE_NONE;
 
 
 
@@ -88,7 +99,7 @@ static int gatt_chr_access_cb(uint16_t conn_h, uint16_t attr_h,
         if (decode_ble_frame(write_data, om_len, &f)) {
             ESP_LOGI("BLE_NIMBLE", "✅ Frame decodificato: op=%s", f.op);
             f.origin = ORIGIN_BLE;
-            xQueueSend(cmdQ, &f, 0);
+            xQueueSend(cmd_queue, &f, 0);
         } else {
             ESP_LOGW("BLE_NIMBLE", "❌ Errore nella decodifica del frame BLE");
         }
@@ -141,18 +152,35 @@ static int gap_evt_cb(struct ble_gap_event *ev, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (ev->connect.status == 0) {
             current_conn = ev->connect.conn_handle;
-            ESP_LOGI("BLE_NIMBLE", "Client connesso!");
+            ble_state = BLE_UP;
+            ESP_LOGI("BLE_NIMBLE", "✅ Client connesso - conn_handle=%u", current_conn);
+            
+            // Avvia MTU exchange per ottimizzare chunking
+            ble_gattc_exchange_mtu(current_conn, NULL, NULL);
         } else {
+            ESP_LOGW("BLE_NIMBLE", "❌ Connessione fallita: status=%d", ev->connect.status);
+            ble_state = BLE_ADVERTISING;
             advertise_start();
         }
         break;
 
     case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGI("BLE_NIMBLE", "📱 Client disconnesso - reason=%d", ev->disconnect.reason);
         current_conn = BLE_HS_CONN_HANDLE_NONE;
+        negotiated_mtu = 23;  // Reset to default
+        ble_state = BLE_ADVERTISING;
         advertise_start();
+        break;
+        
+    case BLE_GAP_EVENT_MTU:
+        negotiated_mtu = ev->mtu.value;
+        chunk_config.max_chunk_size = negotiated_mtu - 3;  // ATT header overhead
+        ESP_LOGI("BLE_NIMBLE", "📏 MTU negoziato: %u bytes, chunk_size: %u", 
+                 negotiated_mtu, chunk_config.max_chunk_size);
         break;
 
     default:
+        ESP_LOGV("BLE_NIMBLE", "🔄 GAP event: %d", ev->type);
         break;
     }
     return 0;
@@ -160,18 +188,40 @@ static int gap_evt_cb(struct ble_gap_event *ev, void *arg)
 
 static void advertise_start(void)
 {
+    if (ble_state != BLE_ADVERTISING && ble_state != BLE_STARTING) {
+        ESP_LOGD("BLE_NIMBLE", "⏭️ Skip advertising - stato: %d", ble_state);
+        return;
+    }
+    
     struct ble_gap_adv_params adv = {
         .conn_mode = BLE_GAP_CONN_MODE_UND,
         .disc_mode = BLE_GAP_DISC_MODE_GEN,
+        .itvl_min = 32,    // 20ms (units of 0.625ms)
+        .itvl_max = 160,   // 100ms for balance of discoverability vs power
     };
+    
     struct ble_hs_adv_fields fields = {0};
     fields.name = (uint8_t *)DEVICE_NAME;
     fields.name_len = strlen(DEVICE_NAME);
     fields.name_is_complete = 1;
 
-    ble_gap_adv_set_fields(&fields);
-    ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv,
-                      gap_evt_cb, NULL);
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE("BLE_NIMBLE", "❌ Errore impostazione adv fields: %d", rc);
+        ble_state = BLE_ERROR;
+        return;
+    }
+    
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv,
+                          gap_evt_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE("BLE_NIMBLE", "❌ Errore avvio advertising: %d", rc);
+        ble_state = BLE_ERROR;
+        return;
+    }
+    
+    ble_state = BLE_ADVERTISING;
+    ESP_LOGI("BLE_NIMBLE", "📡 Advertising avviato - device: %s", DEVICE_NAME);
 }
 
 /* ──────────────── TX task ──────────────── */
@@ -206,10 +256,34 @@ static void notify_resp(const resp_frame_t *r)
 static void tx_task(void *arg)
 {
     resp_frame_t resp;
+    
+    ESP_LOGI("BLE_NIMBLE", "🚀 BLE TX task avviato");
+    
     for (;;) {
-        if (xQueueReceive(respQ, &resp, portMAX_DELAY) == pdTRUE) {
-            if (resp.origin == ORIGIN_BLE) notify_resp(&resp);
-            if (resp.is_final && resp.payload) free(resp.payload);
+        if (xQueueReceive(resp_queue, &resp, portMAX_DELAY) == pdTRUE) {
+            ESP_LOGD("BLE_NIMBLE", "📤 Ricevuta risposta per origin %d", resp.origin);
+            
+            // Invia solo risposte con origin BLE
+            if (resp.origin != ORIGIN_BLE) {
+                ESP_LOGV("BLE_NIMBLE", "⏭️ Risposta non per BLE, saltando");
+                continue;
+            }
+            
+            // Controlla stato BLE prima di inviare
+            if (ble_state != BLE_UP) {
+                ESP_LOGW("BLE_NIMBLE", "⚠️ BLE down - scartando risposta id=%u", resp.id);
+                if (resp.is_final && resp.payload) {
+                    free(resp.payload);
+                }
+                continue;
+            }
+            
+            notify_resp(&resp);
+            
+            // Cleanup payload se finale
+            if (resp.is_final && resp.payload) {
+                free(resp.payload);
+            }
         }
     }
 }
@@ -217,13 +291,17 @@ static void tx_task(void *arg)
 /* ──────────────── Callback di sincronizzazione ──────────────── */
 static void on_sync(void)
 {
-    ESP_LOGI("BLE_NIMBLE", "NimBLE sincronizzato - avvio advertising");
+    ESP_LOGI("BLE_NIMBLE", "✅ NimBLE sincronizzato - avvio advertising");
+    ble_state = BLE_STARTING;
     advertise_start();
 }
 
 static void on_reset(int reason)
 {
-    ESP_LOGW("BLE_NIMBLE", "NimBLE reset, reason=%d", reason);
+    ESP_LOGW("BLE_NIMBLE", "🔄 NimBLE reset, reason=%d", reason);
+    ble_state = BLE_ERROR;
+    current_conn = BLE_HS_CONN_HANDLE_NONE;
+    negotiated_mtu = 23;
 }
 
 /* ──────────────── NimBLE host thread ──────────────── */
@@ -253,12 +331,37 @@ static void host_task(void *param)
 #endif /* CONFIG_MAIN_WITH_BLE */
 
 /* ──────────────── API pubblica ──────────────── */
-void smart_ble_transport_init(QueueHandle_t cQ, QueueHandle_t rQ)
+
+void transport_ble_init(QueueHandle_t cmdQueue, QueueHandle_t respQueue)
+{
+    ESP_LOGI("BLE_NIMBLE", "🏗️ Inizializzazione transport BLE");
+    
+    if (!cmdQueue || !respQueue) {
+        ESP_LOGE("BLE_NIMBLE", "❌ Queue non valide");
+        return;
+    }
+    
+    cmd_queue = cmdQueue;
+    resp_queue = respQueue;
+    ble_state = BLE_DOWN;
+    current_conn = BLE_HS_CONN_HANDLE_NONE;
+    negotiated_mtu = 23;
+    
+    ESP_LOGI("BLE_NIMBLE", "✅ Transport BLE inizializzato");
+}
+
+void transport_ble_start(void)
 {
 #if CONFIG_MAIN_WITH_BLE
-    cmdQ  = cQ;
-    respQ = rQ;
-
+    ESP_LOGI("BLE_NIMBLE", "🚀 Avvio transport BLE");
+    
+    if (ble_state != BLE_DOWN) {
+        ESP_LOGW("BLE_NIMBLE", "⚠️ BLE già avviato, stato: %d", ble_state);
+        return;
+    }
+    
+    ble_state = BLE_STARTING;
+    
     ESP_ERROR_CHECK(nvs_flash_init());
     nimble_port_init();
     
@@ -268,13 +371,129 @@ void smart_ble_transport_init(QueueHandle_t cQ, QueueHandle_t rQ)
     
     nimble_port_freertos_init(host_task);
 
-    xTaskCreate(tx_task, "ble_tx_task", 4096, NULL, 5, NULL);
+    // Crea task TX per risposte
+    BaseType_t result = xTaskCreate(
+        tx_task,
+        "BLE_TX",
+        4096,
+        NULL,
+        5,
+        &tx_task_handle
+    );
+    
+    if (result != pdPASS) {
+        ESP_LOGE("BLE_NIMBLE", "❌ Errore creazione task TX");
+        ble_state = BLE_ERROR;
+        return;
+    }
 
-    ESP_LOGI("BLE_NIMBLE", "Transport inizializzato (NimBLE)");
+    ESP_LOGI("BLE_NIMBLE", "✅ Transport BLE avviato");
 #else
     /* Stub per i test Unity */
     ESP_LOGI("BLE_NIMBLE", "BLE disabled for testing - stub implementation");
-    (void)cQ;
-    (void)rQ;
+    ble_state = BLE_UP;  // Simula stato connesso per test
 #endif
+}
+
+void transport_ble_stop(void)
+{
+    ESP_LOGI("BLE_NIMBLE", "🛑 Arresto transport BLE");
+    
+#if CONFIG_MAIN_WITH_BLE
+    // Ferma advertising se attivo
+    if (ble_state == BLE_ADVERTISING || ble_state == BLE_UP) {
+        ble_gap_adv_stop();
+    }
+    
+    // Disconnetti client se connesso
+    if (current_conn != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(current_conn, BLE_ERR_REM_USER_CONN_TERM);
+        current_conn = BLE_HS_CONN_HANDLE_NONE;
+    }
+#endif
+    
+    ble_state = BLE_DOWN;
+    negotiated_mtu = 23;
+    
+    ESP_LOGI("BLE_NIMBLE", "✅ Transport BLE arrestato");
+}
+
+bool transport_ble_is_connected(void)
+{
+    return (ble_state == BLE_UP);
+}
+
+ble_state_t transport_ble_get_state(void)
+{
+    return ble_state;
+}
+
+void transport_ble_cleanup(void)
+{
+    ESP_LOGI("BLE_NIMBLE", "🧹 Cleanup transport BLE");
+    
+    transport_ble_stop();
+    
+#if CONFIG_MAIN_WITH_BLE
+    // Ferma task TX
+    if (tx_task_handle) {
+        vTaskDelete(tx_task_handle);
+        tx_task_handle = NULL;
+    }
+    
+    // Cleanup NimBLE stack
+    if (ble_state != BLE_DOWN) {
+        nimble_port_stop();
+        nimble_port_deinit();
+    }
+#endif
+    
+    // Reset stato
+    cmd_queue = NULL;
+    resp_queue = NULL;
+    ble_state = BLE_DOWN;
+    current_conn = BLE_HS_CONN_HANDLE_NONE;
+    negotiated_mtu = 23;
+    
+    ESP_LOGI("BLE_NIMBLE", "✅ Cleanup transport BLE completato");
+}
+
+esp_err_t transport_ble_set_chunk_config(const ble_chunk_config_t *config)
+{
+    if (!config) {
+        // Reset to defaults
+        chunk_config.max_chunk_size = (negotiated_mtu > 23) ? negotiated_mtu - 3 : 20;
+        chunk_config.max_concurrent = 4;
+        chunk_config.reassembly_timeout_ms = 2000;
+    } else {
+        chunk_config = *config;
+    }
+    
+    ESP_LOGI("BLE_NIMBLE", "📏 Chunk config: size=%u, concurrent=%u, timeout=%lu ms",
+             chunk_config.max_chunk_size, chunk_config.max_concurrent, 
+             chunk_config.reassembly_timeout_ms);
+             
+    return ESP_OK;
+}
+
+esp_err_t transport_ble_get_connection_info(uint16_t *conn_handle, 
+                                          uint16_t *mtu, 
+                                          uint8_t *chunks_pending)
+{
+    if (ble_state != BLE_UP) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (conn_handle) *conn_handle = current_conn;
+    if (mtu) *mtu = negotiated_mtu;
+    if (chunks_pending) *chunks_pending = 0;  // TODO: implement chunking tracking
+    
+    return ESP_OK;
+}
+
+/* Legacy API - backward compatibility */
+void smart_ble_transport_init(QueueHandle_t cQ, QueueHandle_t rQ)
+{
+    transport_ble_init(cQ, rQ);
+    transport_ble_start();  // Auto-start for legacy compatibility
 }
