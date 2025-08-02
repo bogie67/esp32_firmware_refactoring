@@ -36,6 +36,11 @@ static void wifi_stack_init(void)
 
 
 
+#ifdef CONFIG_RUN_UNITY_TESTS
+#include "unity.h"
+#include "unity_test_runner.h"
+#endif
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting NimBLE demo");

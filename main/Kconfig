@@ -5,4 +5,10 @@ menu "Main Component Options"
         help
             Untick when building unit-test-app to skip NimBLE initialization.
             This prevents crashes during Unity testing.
+            
+    config RUN_UNITY_TESTS
+        bool "Run Unity tests instead of main app"
+        default n
+        help
+            Run Unity test menu instead of the main application.
 endmenu
