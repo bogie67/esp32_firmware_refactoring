@@ -5,9 +5,12 @@
 #include "transport_ble.h"
 #include "codec.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_random.h"
 #include "freertos/task.h"
 #include "string.h"
 #include "nvs_flash.h"
+#include <inttypes.h>
 
 #if CONFIG_MAIN_WITH_BLE
 /* NimBLE */
@@ -39,7 +42,82 @@ static ble_chunk_config_t chunk_config = {
     .reassembly_timeout_ms = 2000
 };
 
+/* ──────────────── Back-off & resilience ──────────────── */
+static esp_timer_handle_t advertising_timer = NULL;
+static uint32_t advertising_backoff_ms = 1000;  // Initial: 1 second
+static const uint32_t ADVERTISING_BACKOFF_MAX_MS = 32000;  // Max: 32 seconds
+static const uint32_t ADVERTISING_BACKOFF_INITIAL_MS = 1000;  // Reset value
+
 #if CONFIG_MAIN_WITH_BLE
+
+/* ──────────────── Forward declarations ──────────────── */
+static void advertise_start(void);
+
+/* ──────────────── Back-off advertising helpers ──────────────── */
+
+/**
+ * @brief Schedula re-advertising con back-off exponential + jitter
+ */
+static void schedule_advertising_backoff(void)
+{
+    if (ble_state != BLE_ADVERTISING) {
+        ESP_LOGD("BLE_NIMBLE", "⏭️ Skip back-off scheduling - stato: %d", ble_state);
+        return;
+    }
+    
+    if (esp_timer_is_active(advertising_timer)) {
+        ESP_LOGD("BLE_NIMBLE", "⏰ Timer advertising già attivo");
+        return;  // Timer già schedulato
+    }
+    
+    // Jitter ±10% per evitare thundering herd
+    uint32_t jitter = esp_random() % (advertising_backoff_ms / 10);
+    uint32_t total_delay = advertising_backoff_ms + jitter;
+    
+    ESP_LOGW("BLE_NIMBLE", "📡 Re-advertising in %" PRIu32 " ms (backoff: %" PRIu32 " + jitter: %" PRIu32 ")", 
+             total_delay, advertising_backoff_ms, jitter);
+    
+    // Avvia timer one-shot
+    esp_err_t err = esp_timer_start_once(advertising_timer, total_delay * 1000ULL);
+    if (err != ESP_OK) {
+        ESP_LOGE("BLE_NIMBLE", "❌ Errore avvio timer advertising: %s", esp_err_to_name(err));
+        return;
+    }
+    
+    // Raddoppia back-off per prossimo tentativo (con limite massimo)
+    advertising_backoff_ms = (advertising_backoff_ms * 2 > ADVERTISING_BACKOFF_MAX_MS) 
+                           ? ADVERTISING_BACKOFF_MAX_MS 
+                           : advertising_backoff_ms * 2;
+}
+
+/**
+ * @brief Callback timer per re-advertising
+ */
+static void advertising_timer_callback(void *arg)
+{
+    ESP_LOGI("BLE_NIMBLE", "🔄 Timer advertising scaduto - riavvio advertising");
+    
+    if (ble_state == BLE_ADVERTISING) {
+        // Riavvia advertising (advertise_start gestisce già lo stato)
+        advertise_start();
+    }
+}
+
+/**
+ * @brief Reset back-off su connessione riuscita
+ */
+static void reset_advertising_backoff(void)
+{
+    // Ferma timer se attivo
+    if (advertising_timer && esp_timer_is_active(advertising_timer)) {
+        esp_timer_stop(advertising_timer);
+        ESP_LOGD("BLE_NIMBLE", "⏰ Timer advertising fermato");
+    }
+    
+    // Reset back-off a valore iniziale
+    advertising_backoff_ms = ADVERTISING_BACKOFF_INITIAL_MS;
+    ESP_LOGD("BLE_NIMBLE", "🔄 Back-off advertising reset a %" PRIu32 " ms", advertising_backoff_ms);
+}
 
 /* ──────────────── UUIDs ──────────────── */
 static const ble_uuid16_t svc_uuid = BLE_UUID16_INIT(0x00FF);
@@ -144,7 +222,6 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
 };
 
 /* ──────────────── GAP helpers ──────────────── */
-static void advertise_start(void);
 
 static int gap_evt_cb(struct ble_gap_event *ev, void *arg)
 {
@@ -155,12 +232,16 @@ static int gap_evt_cb(struct ble_gap_event *ev, void *arg)
             ble_state = BLE_UP;
             ESP_LOGI("BLE_NIMBLE", "✅ Client connesso - conn_handle=%u", current_conn);
             
+            // Reset back-off su connessione riuscita
+            reset_advertising_backoff();
+            
             // Avvia MTU exchange per ottimizzare chunking
             ble_gattc_exchange_mtu(current_conn, NULL, NULL);
         } else {
             ESP_LOGW("BLE_NIMBLE", "❌ Connessione fallita: status=%d", ev->connect.status);
             ble_state = BLE_ADVERTISING;
-            advertise_start();
+            // Schedula re-advertising con back-off
+            schedule_advertising_backoff();
         }
         break;
 
@@ -169,6 +250,8 @@ static int gap_evt_cb(struct ble_gap_event *ev, void *arg)
         current_conn = BLE_HS_CONN_HANDLE_NONE;
         negotiated_mtu = 23;  // Reset to default
         ble_state = BLE_ADVERTISING;
+        
+        // Riavvia advertising immediatamente dopo disconnessione
         advertise_start();
         break;
         
@@ -177,6 +260,14 @@ static int gap_evt_cb(struct ble_gap_event *ev, void *arg)
         chunk_config.max_chunk_size = negotiated_mtu - 3;  // ATT header overhead
         ESP_LOGI("BLE_NIMBLE", "📏 MTU negoziato: %u bytes, chunk_size: %u", 
                  negotiated_mtu, chunk_config.max_chunk_size);
+        break;
+        
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+        if (ble_state == BLE_ADVERTISING) {
+            ESP_LOGD("BLE_NIMBLE", "📡 Advertising completato - schedulo back-off");
+            // Advertising terminato senza connessioni, schedula back-off
+            schedule_advertising_backoff();
+        }
         break;
 
     default:
@@ -193,11 +284,30 @@ static void advertise_start(void)
         return;
     }
     
+    // Ferma advertising esistente prima di riavviare
+    ble_gap_adv_stop();
+    
+    // Parametri advertising adattivi basati su back-off
+    uint16_t adv_interval_min, adv_interval_max;
+    uint32_t adv_duration_ms;
+    
+    if (advertising_backoff_ms <= ADVERTISING_BACKOFF_INITIAL_MS) {
+        // Fast advertising iniziale
+        adv_interval_min = 32;   // 20ms
+        adv_interval_max = 80;   // 50ms  
+        adv_duration_ms = 30000; // 30 secondi
+    } else {
+        // Slow advertising dopo back-off
+        adv_interval_min = 160;  // 100ms
+        adv_interval_max = 480;  // 300ms
+        adv_duration_ms = 10000; // 10 secondi
+    }
+    
     struct ble_gap_adv_params adv = {
         .conn_mode = BLE_GAP_CONN_MODE_UND,
         .disc_mode = BLE_GAP_DISC_MODE_GEN,
-        .itvl_min = 32,    // 20ms (units of 0.625ms)
-        .itvl_max = 160,   // 100ms for balance of discoverability vs power
+        .itvl_min = adv_interval_min,
+        .itvl_max = adv_interval_max,
     };
     
     struct ble_hs_adv_fields fields = {0};
@@ -209,19 +319,23 @@ static void advertise_start(void)
     if (rc != 0) {
         ESP_LOGE("BLE_NIMBLE", "❌ Errore impostazione adv fields: %d", rc);
         ble_state = BLE_ERROR;
+        schedule_advertising_backoff();
         return;
     }
     
-    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv,
+    // Advertising con timeout limitato per attivare back-off
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, adv_duration_ms * 1000, &adv,
                           gap_evt_cb, NULL);
     if (rc != 0) {
         ESP_LOGE("BLE_NIMBLE", "❌ Errore avvio advertising: %d", rc);
         ble_state = BLE_ERROR;
+        schedule_advertising_backoff();
         return;
     }
     
     ble_state = BLE_ADVERTISING;
-    ESP_LOGI("BLE_NIMBLE", "📡 Advertising avviato - device: %s", DEVICE_NAME);
+    ESP_LOGI("BLE_NIMBLE", "📡 Advertising avviato - device: %s, interval: %u-%ums, duration: %lums", 
+             DEVICE_NAME, adv_interval_min * 625 / 1000, adv_interval_max * 625 / 1000, adv_duration_ms);
 }
 
 /* ──────────────── TX task ──────────────── */
@@ -371,6 +485,18 @@ void transport_ble_start(void)
     
     nimble_port_freertos_init(host_task);
 
+    // Crea timer per back-off advertising
+    const esp_timer_create_args_t timer_args = {
+        .callback = &advertising_timer_callback,
+        .name = "ble_adv_backoff"
+    };
+    esp_err_t err = esp_timer_create(&timer_args, &advertising_timer);
+    if (err != ESP_OK) {
+        ESP_LOGE("BLE_NIMBLE", "❌ Errore creazione timer advertising: %s", esp_err_to_name(err));
+        ble_state = BLE_ERROR;
+        return;
+    }
+
     // Crea task TX per risposte
     BaseType_t result = xTaskCreate(
         tx_task,
@@ -387,7 +513,8 @@ void transport_ble_start(void)
         return;
     }
 
-    ESP_LOGI("BLE_NIMBLE", "✅ Transport BLE avviato");
+    ESP_LOGI("BLE_NIMBLE", "✅ Transport BLE avviato - back-off: %" PRIu32 "-%" PRIu32 " ms", 
+             ADVERTISING_BACKOFF_INITIAL_MS, ADVERTISING_BACKOFF_MAX_MS);
 #else
     /* Stub per i test Unity */
     ESP_LOGI("BLE_NIMBLE", "BLE disabled for testing - stub implementation");
@@ -400,6 +527,12 @@ void transport_ble_stop(void)
     ESP_LOGI("BLE_NIMBLE", "🛑 Arresto transport BLE");
     
 #if CONFIG_MAIN_WITH_BLE
+    // Ferma timer advertising se attivo
+    if (advertising_timer && esp_timer_is_active(advertising_timer)) {
+        esp_timer_stop(advertising_timer);
+        ESP_LOGD("BLE_NIMBLE", "⏰ Timer advertising fermato");
+    }
+    
     // Ferma advertising se attivo
     if (ble_state == BLE_ADVERTISING || ble_state == BLE_UP) {
         ble_gap_adv_stop();
@@ -414,6 +547,7 @@ void transport_ble_stop(void)
     
     ble_state = BLE_DOWN;
     negotiated_mtu = 23;
+    advertising_backoff_ms = ADVERTISING_BACKOFF_INITIAL_MS;
     
     ESP_LOGI("BLE_NIMBLE", "✅ Transport BLE arrestato");
 }
@@ -435,6 +569,12 @@ void transport_ble_cleanup(void)
     transport_ble_stop();
     
 #if CONFIG_MAIN_WITH_BLE
+    // Cleanup timer advertising
+    if (advertising_timer) {
+        esp_timer_delete(advertising_timer);
+        advertising_timer = NULL;
+    }
+    
     // Ferma task TX
     if (tx_task_handle) {
         vTaskDelete(tx_task_handle);
@@ -454,6 +594,7 @@ void transport_ble_cleanup(void)
     ble_state = BLE_DOWN;
     current_conn = BLE_HS_CONN_HANDLE_NONE;
     negotiated_mtu = 23;
+    advertising_backoff_ms = ADVERTISING_BACKOFF_INITIAL_MS;
     
     ESP_LOGI("BLE_NIMBLE", "✅ Cleanup transport BLE completato");
 }
