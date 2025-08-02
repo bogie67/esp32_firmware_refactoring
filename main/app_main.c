@@ -18,7 +18,8 @@
 
 static const char *TAG = "APP_MAIN";
 QueueHandle_t cmdQueue;
-QueueHandle_t respQueue;
+QueueHandle_t respQueue_BLE;
+QueueHandle_t respQueue_MQTT;
 
 // Task rimosso - ora usiamo cmd_proc_start() da cmd_proc_task.c
 
@@ -115,16 +116,17 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     cmdQueue = xQueueCreate(10, sizeof(cmd_frame_t));
-    respQueue = xQueueCreate(10, sizeof(resp_frame_t));
+    respQueue_BLE = xQueueCreate(10, sizeof(resp_frame_t));
+    respQueue_MQTT = xQueueCreate(10, sizeof(resp_frame_t));
 
     wifi_stack_init();
     cmd_proc_start();
     solenoid_init();
 
 #if CONFIG_MAIN_WITH_BLE
-   smart_ble_transport_init(cmdQueue, respQueue);
+   smart_ble_transport_init(cmdQueue, respQueue_BLE);
 #endif
 
     // Inizializza transport MQTT (start viene chiamato dopo connessione WiFi)
-    transport_mqtt_init(cmdQueue, respQueue);
+    transport_mqtt_init(cmdQueue, respQueue_MQTT);
 }

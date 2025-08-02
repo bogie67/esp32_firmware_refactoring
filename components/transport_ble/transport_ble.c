@@ -4,6 +4,7 @@
  */
 #include "transport_ble.h"
 #include "codec.h"
+#include "chunk_manager.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_random.h"
@@ -47,6 +48,9 @@ static esp_timer_handle_t advertising_timer = NULL;
 static uint32_t advertising_backoff_ms = 1000;  // Initial: 1 second
 static const uint32_t ADVERTISING_BACKOFF_MAX_MS = 32000;  // Max: 32 seconds
 static const uint32_t ADVERTISING_BACKOFF_INITIAL_MS = 1000;  // Reset value
+
+/* ──────────────── Chunking integration ──────────────── */
+static bool chunk_manager_initialized = false;
 
 #if CONFIG_MAIN_WITH_BLE
 
@@ -162,8 +166,7 @@ static int gatt_chr_access_cb(uint16_t conn_h, uint16_t attr_h,
     // Gestione scrittura caratteristiche
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
         uint16_t om_len = OS_MBUF_PKTLEN(ctxt->om);
-        ESP_LOGI("BLE_NIMBLE", "WRITE RX len=%d", om_len);
-        ESP_LOGI("BLE_NIMBLE", "📨 Characteristic WRITE: handle=0x%04x, len=%d", attr_h, om_len);
+        ESP_LOGD("BLE_NIMBLE", "📨 Characteristic WRITE: handle=0x%04x, len=%d", attr_h, om_len);
         
         uint8_t *write_data = malloc(om_len);
         if (!write_data) {
@@ -173,13 +176,67 @@ static int gatt_chr_access_cb(uint16_t conn_h, uint16_t attr_h,
         
         ble_hs_mbuf_to_flat(ctxt->om, write_data, om_len, NULL);
         
+        // Check if this might be a chunk
+        if (chunk_manager_initialized && om_len >= sizeof(chunk_header_t)) {
+            const chunk_header_t *header = (const chunk_header_t*)write_data;
+            
+            ESP_LOGD("BLE_NIMBLE", "🔍 Frame analysis: len=%d, flags=0x%02x, chunk_idx=%u, total_chunks=%u, frame_id=%u",
+                     om_len, header->flags, header->chunk_idx, header->total_chunks, header->frame_id);
+            
+            // More robust chunk detection: check multiple header fields
+            bool is_chunk = (header->flags & CHUNK_FLAG_CHUNKED) && 
+                           (header->chunk_idx < 8) &&  // Valid chunk index
+                           (header->total_chunks > 0 && header->total_chunks <= 8) &&  // Valid total chunks
+                           (header->frame_id != 0) &&  // Valid frame ID
+                           (header->chunk_size <= (chunk_config.max_chunk_size - sizeof(chunk_header_t)));  // Valid chunk size
+            
+            ESP_LOGD("BLE_NIMBLE", "🔍 Chunk detection result: %s", is_chunk ? "CHUNK" : "DIRECT_FRAME");
+            
+            if (is_chunk) {
+                ESP_LOGD("BLE_NIMBLE", "📦 Received chunk %u/%u for frame %u", 
+                         header->chunk_idx + 1, header->total_chunks, header->frame_id);
+                
+                reassembly_result_t reassembly_result;
+                esp_err_t err = chunk_manager_process(write_data, om_len, &reassembly_result);
+                
+                if (err == ESP_OK) {
+                    if (reassembly_result.is_complete) {
+                        ESP_LOGI("BLE_NIMBLE", "✅ Frame %u completed via chunking, size: %zu", 
+                                 reassembly_result.frame_id, reassembly_result.frame_size);
+                        
+                        // Decode the complete frame
+                        cmd_frame_t f;
+                        if (decode_ble_frame(reassembly_result.complete_frame, reassembly_result.frame_size, &f)) {
+                            f.origin = ORIGIN_BLE;
+                            xQueueSend(cmd_queue, &f, 0);
+                            ESP_LOGI("BLE_NIMBLE", "✅ Chunked frame decoded: op=%s", f.op);
+                        } else {
+                            ESP_LOGE("BLE_NIMBLE", "❌ Failed to decode complete chunked frame");
+                        }
+                        
+                        free(reassembly_result.complete_frame);
+                    } else if (reassembly_result.is_duplicate) {
+                        ESP_LOGD("BLE_NIMBLE", "🔄 Duplicate chunk ignored");
+                    } else {
+                        ESP_LOGD("BLE_NIMBLE", "📝 Chunk stored, waiting for more");
+                    }
+                } else {
+                    ESP_LOGE("BLE_NIMBLE", "❌ Chunk processing failed: %s", esp_err_to_name(err));
+                }
+                
+                free(write_data);
+                return 0;
+            }
+        }
+        
+        // Try direct frame decode (not chunked or chunking disabled)
         cmd_frame_t f;
         if (decode_ble_frame(write_data, om_len, &f)) {
-            ESP_LOGI("BLE_NIMBLE", "✅ Frame decodificato: op=%s", f.op);
+            ESP_LOGI("BLE_NIMBLE", "✅ Direct frame decoded: op=%s", f.op);
             f.origin = ORIGIN_BLE;
             xQueueSend(cmd_queue, &f, 0);
         } else {
-            ESP_LOGW("BLE_NIMBLE", "❌ Errore nella decodifica del frame BLE");
+            ESP_LOGW("BLE_NIMBLE", "❌ Failed to decode frame (len=%d)", om_len);
         }
         
         free(write_data);
@@ -258,6 +315,25 @@ static int gap_evt_cb(struct ble_gap_event *ev, void *arg)
     case BLE_GAP_EVENT_MTU:
         negotiated_mtu = ev->mtu.value;
         chunk_config.max_chunk_size = negotiated_mtu - 3;  // ATT header overhead
+        
+        // Update chunk manager with new MTU
+        if (chunk_manager_initialized) {
+            chunk_manager_deinit();
+            
+            chunk_config_t chunk_cfg = {
+                .max_chunk_size = negotiated_mtu - 3,
+                .header_size = sizeof(chunk_header_t),
+                .max_concurrent_frames = chunk_config.max_concurrent,
+                .reassembly_timeout_ms = chunk_config.reassembly_timeout_ms
+            };
+            
+            esp_err_t err = chunk_manager_init(&chunk_cfg);
+            if (err != ESP_OK) {
+                ESP_LOGW("BLE_NIMBLE", "⚠️ Failed to reinit chunk manager with new MTU");
+                chunk_manager_initialized = false;
+            }
+        }
+        
         ESP_LOGI("BLE_NIMBLE", "📏 MTU negoziato: %u bytes, chunk_size: %u", 
                  negotiated_mtu, chunk_config.max_chunk_size);
         break;
@@ -341,6 +417,9 @@ static void advertise_start(void)
 /* ──────────────── TX task ──────────────── */
 static void notify_resp(const resp_frame_t *r)
 {
+    ESP_LOGI("BLE_NIMBLE", "🔔 notify_resp called: id=%u, payload_size=%zu", 
+             r->id, r->payload ? strlen((char*)r->payload) : 0);
+             
     if (current_conn == BLE_HS_CONN_HANDLE_NONE) {
         ESP_LOGW("BLE_NIMBLE", "❌ No client connected - skipping notify");
         return;
@@ -353,18 +432,64 @@ static void notify_resp(const resp_frame_t *r)
         return;
     }
 
-    ESP_LOGI("BLE_NIMBLE", "📤 Sending notify: conn=%d, handle=%d, len=%zu", 
+    ESP_LOGD("BLE_NIMBLE", "📤 Sending response: conn=%d, handle=%d, len=%zu", 
              current_conn, tx_handle, len);
 
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
-    free(buf);
-    int rc = ble_gattc_notify_custom(current_conn, tx_handle, om);
-    
-    if (rc == 0) {
-        ESP_LOGI("BLE_NIMBLE", "✅ Notifica inviata con successo");
+    // Check if chunking is needed
+    if (chunk_manager_initialized && len > (negotiated_mtu - 3)) {
+        // Use chunking for large responses
+        chunk_result_t chunk_result;
+        esp_err_t err = chunk_manager_send(buf, len, &chunk_result);
+        if (err == ESP_OK) {
+            ESP_LOGI("BLE_NIMBLE", "📦 Response chunked into %u parts, frame_id=%u", 
+                     chunk_result.chunk_count, chunk_result.frame_id);
+            
+            // Send all chunks
+            for (uint8_t i = 0; i < chunk_result.chunk_count; i++) {
+                struct os_mbuf *om = ble_hs_mbuf_from_flat(chunk_result.chunks[i], chunk_result.chunk_sizes[i]);
+                if (om) {
+                    int rc = ble_gattc_notify_custom(current_conn, tx_handle, om);
+                    if (rc == 0) {
+                        ESP_LOGD("BLE_NIMBLE", "✅ Chunk %u/%u sent successfully", 
+                                 i + 1, chunk_result.chunk_count);
+                    } else {
+                        ESP_LOGE("BLE_NIMBLE", "❌ Failed to send chunk %u: %d", i, rc);
+                        break;  // Stop on first error
+                    }
+                    
+                    // Small delay between chunks to avoid mbuf exhaustion
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                } else {
+                    ESP_LOGE("BLE_NIMBLE", "❌ Failed to create mbuf for chunk %u", i);
+                    break;
+                }
+            }
+            
+            chunk_manager_free_send_result(&chunk_result);
+        } else {
+            ESP_LOGE("BLE_NIMBLE", "❌ Chunking failed: %s", esp_err_to_name(err));
+            // Fallback to direct send (will likely fail but try anyway)
+            struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
+            if (om) {
+                ble_gattc_notify_custom(current_conn, tx_handle, om);
+            }
+        }
     } else {
-        ESP_LOGE("BLE_NIMBLE", "❌ Errore invio notifica: %d", rc);
+        // Direct send for small responses
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
+        if (om) {
+            int rc = ble_gattc_notify_custom(current_conn, tx_handle, om);
+            if (rc == 0) {
+                ESP_LOGI("BLE_NIMBLE", "✅ Direct notify sent successfully, len=%zu", len);
+            } else {
+                ESP_LOGE("BLE_NIMBLE", "❌ Direct notify failed: %d", rc);
+            }
+        } else {
+            ESP_LOGE("BLE_NIMBLE", "❌ Failed to create mbuf for direct send");
+        }
     }
+
+    free(buf);
 }
 
 static void tx_task(void *arg)
@@ -375,11 +500,12 @@ static void tx_task(void *arg)
     
     for (;;) {
         if (xQueueReceive(resp_queue, &resp, portMAX_DELAY) == pdTRUE) {
-            ESP_LOGD("BLE_NIMBLE", "📤 Ricevuta risposta per origin %d", resp.origin);
+            ESP_LOGI("BLE_NIMBLE", "📤 TX task ricevuta risposta: id=%u, origin=%d, payload_size=%zu", 
+                     resp.id, resp.origin, resp.payload ? strlen((char*)resp.payload) : 0);
             
             // Invia solo risposte con origin BLE
             if (resp.origin != ORIGIN_BLE) {
-                ESP_LOGV("BLE_NIMBLE", "⏭️ Risposta non per BLE, saltando");
+                ESP_LOGW("BLE_NIMBLE", "⏭️ Risposta con origin %d diverso da BLE (%d), saltando", resp.origin, ORIGIN_BLE);
                 continue;
             }
             
@@ -485,12 +611,29 @@ void transport_ble_start(void)
     
     nimble_port_freertos_init(host_task);
 
+    // Initialize chunk manager
+    chunk_config_t chunk_cfg = {
+        .max_chunk_size = negotiated_mtu - 3,  // Will be updated after MTU negotiation
+        .header_size = sizeof(chunk_header_t),
+        .max_concurrent_frames = chunk_config.max_concurrent,
+        .reassembly_timeout_ms = chunk_config.reassembly_timeout_ms
+    };
+    
+    esp_err_t err = chunk_manager_init(&chunk_cfg);
+    if (err == ESP_OK) {
+        chunk_manager_initialized = true;
+        ESP_LOGI("BLE_NIMBLE", "✅ Chunk manager initialized - max_chunk: %u", chunk_cfg.max_chunk_size);
+    } else {
+        ESP_LOGW("BLE_NIMBLE", "⚠️ Chunk manager init failed: %s", esp_err_to_name(err));
+        chunk_manager_initialized = false;
+    }
+
     // Crea timer per back-off advertising
     const esp_timer_create_args_t timer_args = {
         .callback = &advertising_timer_callback,
         .name = "ble_adv_backoff"
     };
-    esp_err_t err = esp_timer_create(&timer_args, &advertising_timer);
+    err = esp_timer_create(&timer_args, &advertising_timer);
     if (err != ESP_OK) {
         ESP_LOGE("BLE_NIMBLE", "❌ Errore creazione timer advertising: %s", esp_err_to_name(err));
         ble_state = BLE_ERROR;
@@ -568,6 +711,12 @@ void transport_ble_cleanup(void)
     
     transport_ble_stop();
     
+    // Cleanup chunk manager
+    if (chunk_manager_initialized) {
+        chunk_manager_deinit();
+        chunk_manager_initialized = false;
+    }
+    
 #if CONFIG_MAIN_WITH_BLE
     // Cleanup timer advertising
     if (advertising_timer) {
@@ -610,7 +759,26 @@ esp_err_t transport_ble_set_chunk_config(const ble_chunk_config_t *config)
         chunk_config = *config;
     }
     
-    ESP_LOGI("BLE_NIMBLE", "📏 Chunk config: size=%u, concurrent=%u, timeout=%lu ms",
+    // Update chunk manager if initialized
+    if (chunk_manager_initialized) {
+        chunk_manager_deinit();
+        
+        chunk_config_t chunk_cfg = {
+            .max_chunk_size = chunk_config.max_chunk_size,
+            .header_size = sizeof(chunk_header_t),
+            .max_concurrent_frames = chunk_config.max_concurrent,
+            .reassembly_timeout_ms = chunk_config.reassembly_timeout_ms
+        };
+        
+        esp_err_t err = chunk_manager_init(&chunk_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE("BLE_NIMBLE", "❌ Failed to reinit chunk manager: %s", esp_err_to_name(err));
+            chunk_manager_initialized = false;
+            return err;
+        }
+    }
+    
+    ESP_LOGI("BLE_NIMBLE", "📏 Chunk config updated: size=%u, concurrent=%u, timeout=%lu ms",
              chunk_config.max_chunk_size, chunk_config.max_concurrent, 
              chunk_config.reassembly_timeout_ms);
              
@@ -627,7 +795,16 @@ esp_err_t transport_ble_get_connection_info(uint16_t *conn_handle,
     
     if (conn_handle) *conn_handle = current_conn;
     if (mtu) *mtu = negotiated_mtu;
-    if (chunks_pending) *chunks_pending = 0;  // TODO: implement chunking tracking
+    
+    if (chunks_pending) {
+        if (chunk_manager_initialized) {
+            uint8_t active_contexts;
+            chunk_manager_get_stats(&active_contexts, NULL, NULL, NULL);
+            *chunks_pending = active_contexts;
+        } else {
+            *chunks_pending = 0;
+        }
+    }
     
     return ESP_OK;
 }

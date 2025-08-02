@@ -34,6 +34,7 @@ typedef struct {
     uint32_t reassembly_timeout_ms; ///< Timeout riassemblaggio (default: 2000ms)
 } ble_chunk_config_t;
 
+
 /**
  * @brief Inizializza il transport BLE con code di comando e risposta
  * 

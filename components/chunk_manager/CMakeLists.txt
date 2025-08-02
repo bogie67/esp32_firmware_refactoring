@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS 
+        "chunk_manager.c"
+    INCLUDE_DIRS 
+        "."
+    REQUIRES 
+        esp_common
+        log
+        esp_timer
+        freertos
+        protocol_types
+)

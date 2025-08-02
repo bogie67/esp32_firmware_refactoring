@@ -13,6 +13,12 @@ int8_t svc_wifi_scan(uint8_t **json_out, size_t *len)
 {
     ESP_LOGI(TAG, "🔍 Starting WiFi scan...");
     
+    // Critical: ensure pointers are valid
+    if (!json_out || !len) {
+        ESP_LOGE(TAG, "❌ Invalid parameters: json_out=%p, len=%p", json_out, len);
+        return -1;
+    }
+    
     wifi_scan_config_t cfg = { .show_hidden = true };
     esp_err_t ret = esp_wifi_scan_start(&cfg, true);
     if (ret != ESP_OK) {
@@ -52,6 +58,7 @@ int8_t svc_wifi_scan(uint8_t **json_out, size_t *len)
     *len = strlen(str);
     
     ESP_LOGI(TAG, "✅ WiFi scan completed successfully, JSON size: %zu bytes", *len);
+    ESP_LOGI(TAG, "🎯 svc_wifi_scan returning 0 (success) - json_out=%p, len=%zu", *json_out, *len);
     return 0;
 }
 
