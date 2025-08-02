@@ -4,8 +4,6 @@
  */
 #include "transport_ble.h"
 #include "codec.h"
-#include "cmd_frame.h"
-#include "resp_frame.h"
 #include "esp_log.h"
 #include "freertos/task.h"
 #include "string.h"

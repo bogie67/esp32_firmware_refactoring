@@ -2,4 +2,16 @@ build/
 .DS_Store
 *.zip
 .claude/
+attic/
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.tmp.*
+*.tmp.*
+*.tmp.drivedownload/
+*.tmp.drivedownload.*
+*.tmp.driveupload/
+*.tmp.driveupload.*
 # VSCode configurations are included for better DX.tmp.driveupload/

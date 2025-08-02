@@ -1,0 +1,16 @@
+# Unity test configuration
+CONFIG_UNITY_ENABLE_IDF_TEST_RUNNER=y
+CONFIG_UNITY_ENABLE_FIXTURE=y
+
+# Disable watchdog for tests (prevents timeout during interactive testing)
+CONFIG_ESP_TASK_WDT_EN=n
+CONFIG_ESP_INT_WDT_EN=n
+
+# Increase main task stack for tests
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+
+# Enable heap debugging for tests
+CONFIG_HEAP_POISONING_COMPREHENSIVE=y
+
+# Codec test specific config
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
