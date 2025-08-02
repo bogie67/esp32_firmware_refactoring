@@ -36,6 +36,10 @@ static uint16_t current_conn = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t negotiated_mtu = 23;  // Default BLE ATT MTU
 static TaskHandle_t tx_task_handle = NULL;
 
+/* ──────────────── GATT handles ──────────────── */
+static uint16_t rx_handle;          /* valore scritto da NimBLE */
+static uint16_t tx_handle;          /* valore scritto da NimBLE */
+
 /* ──────────────── Chunking configuration ──────────────── */
 static ble_chunk_config_t chunk_config = {
     .max_chunk_size = 20,      // Will be updated after MTU negotiation
@@ -52,10 +56,31 @@ static const uint32_t ADVERTISING_BACKOFF_INITIAL_MS = 1000;  // Reset value
 /* ──────────────── Chunking integration ──────────────── */
 static bool chunk_manager_initialized = false;
 
+/* ──────────────── Back-pressure & retry logic ──────────────── */
+typedef struct {
+    uint32_t retry_count;           ///< Current retry attempt
+    uint32_t last_retry_ms;         ///< Timestamp of last retry
+    uint32_t backoff_delay_ms;      ///< Current back-off delay
+    uint32_t consecutive_failures;  ///< Consecutive send failures
+    bool circuit_breaker_open;     ///< Circuit breaker state
+} backpressure_state_t;
+
+static backpressure_state_t bp_state = {0};
+static const uint32_t RETRY_BACKOFF_INITIAL_MS = 50;   // Initial 50ms
+static const uint32_t RETRY_BACKOFF_MAX_MS = 2000;     // Max 2 seconds  
+static const uint32_t RETRY_MAX_ATTEMPTS = 5;          // Max 5 retries
+static const uint32_t CIRCUIT_BREAKER_THRESHOLD = 10;  // 10 consecutive failures
+static const uint32_t CIRCUIT_BREAKER_TIMEOUT_MS = 5000; // 5 second recovery
+
 #if CONFIG_MAIN_WITH_BLE
 
 /* ──────────────── Forward declarations ──────────────── */
 static void advertise_start(void);
+static bool check_mbuf_availability(void);
+static void backpressure_reset(void);
+static bool backpressure_should_retry(void);
+static void backpressure_record_failure(void);
+static void backpressure_record_success(void);
 
 /* ──────────────── Back-off advertising helpers ──────────────── */
 
@@ -123,13 +148,172 @@ static void reset_advertising_backoff(void)
     ESP_LOGD("BLE_NIMBLE", "🔄 Back-off advertising reset a %" PRIu32 " ms", advertising_backoff_ms);
 }
 
+/* ──────────────── Back-pressure helpers ──────────────── */
+
+/**
+ * @brief Check if mbuf pool has available buffers
+ */
+static bool check_mbuf_availability(void)
+{
+    // Get available mbuf count from NimBLE
+    // Note: This is an approximation since NimBLE doesn't expose exact counts
+    struct os_mbuf *test_mbuf = ble_hs_mbuf_from_flat(NULL, 0);
+    if (test_mbuf) {
+        os_mbuf_free_chain(test_mbuf);
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Reset back-pressure state on success
+ */
+static void backpressure_reset(void)
+{
+    bp_state.retry_count = 0;
+    bp_state.backoff_delay_ms = RETRY_BACKOFF_INITIAL_MS;
+    bp_state.consecutive_failures = 0;
+    bp_state.circuit_breaker_open = false;
+    ESP_LOGD("BLE_NIMBLE", "🔄 Back-pressure reset");
+}
+
+/**
+ * @brief Check if we should retry based on back-pressure state
+ */
+static bool backpressure_should_retry(void)
+{
+    uint32_t current_time = (uint32_t)(esp_timer_get_time() / 1000);
+    
+    // Check circuit breaker
+    if (bp_state.circuit_breaker_open) {
+        if ((current_time - bp_state.last_retry_ms) > CIRCUIT_BREAKER_TIMEOUT_MS) {
+            ESP_LOGI("BLE_NIMBLE", "🔧 Circuit breaker recovery attempt");
+            bp_state.circuit_breaker_open = false;
+            bp_state.consecutive_failures = 0;
+            bp_state.retry_count = 0;
+        } else {
+            ESP_LOGD("BLE_NIMBLE", "⛔ Circuit breaker open - blocking retry");
+            return false;
+        }
+    }
+    
+    // Check retry limits
+    if (bp_state.retry_count >= RETRY_MAX_ATTEMPTS) {
+        ESP_LOGW("BLE_NIMBLE", "🚫 Max retry attempts reached: %" PRIu32, RETRY_MAX_ATTEMPTS);
+        return false;
+    }
+    
+    // Check back-off delay
+    if (bp_state.retry_count > 0) {
+        uint32_t time_since_last = current_time - bp_state.last_retry_ms;
+        if (time_since_last < bp_state.backoff_delay_ms) {
+            ESP_LOGD("BLE_NIMBLE", "⏳ Back-off delay active: %" PRIu32 "ms remaining", 
+                     bp_state.backoff_delay_ms - time_since_last);
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+/**
+ * @brief Record a failure for back-pressure calculation
+ */
+static void backpressure_record_failure(void)
+{
+    bp_state.retry_count++;
+    bp_state.consecutive_failures++;
+    bp_state.last_retry_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    
+    // Exponential back-off with jitter
+    bp_state.backoff_delay_ms = bp_state.backoff_delay_ms * 2;
+    if (bp_state.backoff_delay_ms > RETRY_BACKOFF_MAX_MS) {
+        bp_state.backoff_delay_ms = RETRY_BACKOFF_MAX_MS;
+    }
+    
+    // Add jitter ±10%
+    uint32_t jitter = esp_random() % (bp_state.backoff_delay_ms / 10);
+    bp_state.backoff_delay_ms += jitter;
+    
+    ESP_LOGW("BLE_NIMBLE", "📈 Back-pressure failure recorded: retry=%" PRIu32 ", consecutive=%" PRIu32 ", delay=%" PRIu32 "ms", 
+             bp_state.retry_count, bp_state.consecutive_failures, bp_state.backoff_delay_ms);
+    
+    // Check circuit breaker threshold
+    if (bp_state.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD) {
+        bp_state.circuit_breaker_open = true;
+        ESP_LOGE("BLE_NIMBLE", "⛔ Circuit breaker OPEN: %" PRIu32 " consecutive failures", 
+                 bp_state.consecutive_failures);
+    }
+}
+
+/**
+ * @brief Record a success for back-pressure calculation
+ */
+static void backpressure_record_success(void)
+{
+    if (bp_state.retry_count > 0) {
+        ESP_LOGI("BLE_NIMBLE", "✅ Back-pressure recovery: succeeded after %" PRIu32 " retries", 
+                 bp_state.retry_count);
+    }
+    backpressure_reset();
+}
+
+/**
+ * @brief Send single chunk with back-pressure and retry logic
+ */
+static esp_err_t send_chunk_with_backpressure(const uint8_t *chunk_data, size_t chunk_size, 
+                                              uint8_t chunk_idx, uint8_t total_chunks)
+{
+    int attempts = 0;
+    
+    while (attempts < RETRY_MAX_ATTEMPTS) {
+        // Check if we should attempt retry
+        if (!backpressure_should_retry()) {
+            vTaskDelay(pdMS_TO_TICKS(bp_state.backoff_delay_ms));
+            continue;
+        }
+        
+        // Check mbuf availability before attempting send
+        if (!check_mbuf_availability()) {
+            ESP_LOGW("BLE_NIMBLE", "⚠️ Mbuf pool exhausted - chunk %u/%u", chunk_idx + 1, total_chunks);
+            backpressure_record_failure();
+            attempts++;
+            continue;
+        }
+        
+        // Attempt to create mbuf and send
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(chunk_data, chunk_size);
+        if (!om) {
+            ESP_LOGE("BLE_NIMBLE", "❌ Failed to create mbuf for chunk %u/%u", chunk_idx + 1, total_chunks);
+            backpressure_record_failure();
+            attempts++;
+            continue;
+        }
+        
+        int rc = ble_gattc_notify_custom(current_conn, tx_handle, om);
+        if (rc == 0) {
+            ESP_LOGD("BLE_NIMBLE", "✅ Chunk %u/%u sent with back-pressure (attempt %d)", 
+                     chunk_idx + 1, total_chunks, attempts + 1);
+            backpressure_record_success();
+            return ESP_OK;
+        } else {
+            ESP_LOGW("BLE_NIMBLE", "⚠️ Chunk %u/%u send failed: %d (attempt %d)", 
+                     chunk_idx + 1, total_chunks, rc, attempts + 1);
+            // mbuf is automatically freed by NimBLE on failure
+            backpressure_record_failure();
+            attempts++;
+        }
+    }
+    
+    ESP_LOGE("BLE_NIMBLE", "❌ Chunk %u/%u FAILED after %d attempts", 
+             chunk_idx + 1, total_chunks, attempts);
+    return ESP_FAIL;
+}
+
 /* ──────────────── UUIDs ──────────────── */
 static const ble_uuid16_t svc_uuid = BLE_UUID16_INIT(0x00FF);
 static const ble_uuid16_t rx_uuid  = BLE_UUID16_INIT(0xFF01);
 static const ble_uuid16_t tx_uuid  = BLE_UUID16_INIT(0xFF02);
-
-static uint16_t rx_handle;          /* valore scritto da NimBLE */
-static uint16_t tx_handle;          /* valore scritto da NimBLE */
 
 
 
@@ -437,55 +621,60 @@ static void notify_resp(const resp_frame_t *r)
 
     // Check if chunking is needed
     if (chunk_manager_initialized && len > (negotiated_mtu - 3)) {
-        // Use chunking for large responses
+        // Use chunking for large responses with back-pressure
         chunk_result_t chunk_result;
         esp_err_t err = chunk_manager_send(buf, len, &chunk_result);
         if (err == ESP_OK) {
             ESP_LOGI("BLE_NIMBLE", "📦 Response chunked into %u parts, frame_id=%u", 
                      chunk_result.chunk_count, chunk_result.frame_id);
             
-            // Send all chunks
+            bool transmission_successful = true;
+            
+            // Send all chunks with back-pressure management
             for (uint8_t i = 0; i < chunk_result.chunk_count; i++) {
-                struct os_mbuf *om = ble_hs_mbuf_from_flat(chunk_result.chunks[i], chunk_result.chunk_sizes[i]);
-                if (om) {
-                    int rc = ble_gattc_notify_custom(current_conn, tx_handle, om);
-                    if (rc == 0) {
-                        ESP_LOGD("BLE_NIMBLE", "✅ Chunk %u/%u sent successfully", 
-                                 i + 1, chunk_result.chunk_count);
-                    } else {
-                        ESP_LOGE("BLE_NIMBLE", "❌ Failed to send chunk %u: %d", i, rc);
-                        break;  // Stop on first error
-                    }
-                    
-                    // Small delay between chunks to avoid mbuf exhaustion
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                } else {
-                    ESP_LOGE("BLE_NIMBLE", "❌ Failed to create mbuf for chunk %u", i);
-                    break;
+                esp_err_t chunk_err = send_chunk_with_backpressure(
+                    chunk_result.chunks[i], 
+                    chunk_result.chunk_sizes[i], 
+                    i + 1, 
+                    chunk_result.chunk_count
+                );
+                
+                if (chunk_err != ESP_OK) {
+                    ESP_LOGE("BLE_NIMBLE", "❌ Failed to send chunk %u/%u: %s", 
+                             i + 1, chunk_result.chunk_count, esp_err_to_name(chunk_err));
+                    transmission_successful = false;
+                    break;  // Stop on first error
                 }
+            }
+            
+            if (transmission_successful) {
+                backpressure_record_success();
+                ESP_LOGI("BLE_NIMBLE", "✅ All %u chunks sent successfully", chunk_result.chunk_count);
+            } else {
+                backpressure_record_failure();
+                ESP_LOGW("BLE_NIMBLE", "⚠️ Chunked transmission partially failed");
             }
             
             chunk_manager_free_send_result(&chunk_result);
         } else {
             ESP_LOGE("BLE_NIMBLE", "❌ Chunking failed: %s", esp_err_to_name(err));
-            // Fallback to direct send (will likely fail but try anyway)
-            struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
-            if (om) {
-                ble_gattc_notify_custom(current_conn, tx_handle, om);
+            backpressure_record_failure();
+            
+            // Fallback to direct send with back-pressure (will likely fail but try anyway)
+            esp_err_t fallback_err = send_chunk_with_backpressure(buf, len, 1, 1);
+            if (fallback_err != ESP_OK) {
+                ESP_LOGE("BLE_NIMBLE", "❌ Fallback direct send also failed: %s", esp_err_to_name(fallback_err));
             }
         }
     } else {
-        // Direct send for small responses
-        struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
-        if (om) {
-            int rc = ble_gattc_notify_custom(current_conn, tx_handle, om);
-            if (rc == 0) {
-                ESP_LOGI("BLE_NIMBLE", "✅ Direct notify sent successfully, len=%zu", len);
-            } else {
-                ESP_LOGE("BLE_NIMBLE", "❌ Direct notify failed: %d", rc);
-            }
+        // Direct send for small responses with back-pressure
+        esp_err_t send_err = send_chunk_with_backpressure(buf, len, 1, 1);
+        if (send_err == ESP_OK) {
+            ESP_LOGI("BLE_NIMBLE", "✅ Direct notify sent successfully, len=%zu", len);
+            backpressure_record_success();
         } else {
-            ESP_LOGE("BLE_NIMBLE", "❌ Failed to create mbuf for direct send");
+            ESP_LOGE("BLE_NIMBLE", "❌ Direct notify failed: %s", esp_err_to_name(send_err));
+            backpressure_record_failure();
         }
     }
 
