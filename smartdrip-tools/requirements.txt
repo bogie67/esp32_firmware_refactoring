@@ -1,0 +1,22 @@
+# SmartDrip Security1 Testing Tools
+# Requirements for BLE and MQTT Security1 handshake testing
+
+# BLE Support (for macOS/Linux/Windows)
+bleak>=0.21.0
+
+# MQTT Support with WebSocket
+paho-mqtt>=1.6.0
+websocket-client>=1.6.0
+
+# Cryptography for Security1 protocol
+cryptography>=41.0.0
+
+# Optional: Serial communication for ESP32 monitoring
+pyserial>=3.5
+
+# Optional: Rich console output
+rich>=13.0.0
+
+# Development dependencies
+pytest>=7.0.0
+pytest-asyncio>=0.21.0

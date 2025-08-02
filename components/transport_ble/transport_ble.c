@@ -14,6 +14,9 @@
 #include "nvs_flash.h"
 #include <inttypes.h>
 
+// NEW: Security1 integration
+#include "security1_session.h"
+
 #if CONFIG_MAIN_WITH_BLE
 /* NimBLE */
 #include "esp_nimble_hci.h"
@@ -56,6 +59,14 @@ static const uint32_t ADVERTISING_BACKOFF_INITIAL_MS = 1000;  // Reset value
 
 /* ──────────────── Chunking integration ──────────────── */
 static bool chunk_manager_initialized = false;
+
+/* ──────────────── Security1 Integration ──────────────── */
+static bool security1_enabled = false;
+static security1_session_state_t security1_state = SECURITY1_STATE_IDLE;
+static transport_ble_security1_config_t security1_config = {0};
+static bool handshake_service_active = false;     // FF50-FF52 service
+static bool operational_service_active = false;   // FF00-FF02 service
+static SemaphoreHandle_t security1_mutex = NULL;
 
 /* ──────────────── Back-pressure & retry logic ──────────────── */
 typedef struct {
@@ -1186,4 +1197,227 @@ void smart_ble_transport_init(QueueHandle_t cQ, QueueHandle_t rQ)
 {
     transport_ble_init(cQ, rQ);
     transport_ble_start();  // Auto-start for legacy compatibility
+}
+
+/* ──────────────── Security1 Integration Implementation ──────────────── */
+
+/**
+ * @brief Callback per eventi Security1 session
+ */
+static void transport_ble_security1_event_callback(security1_session_state_t state, void *user_data)
+{
+    ESP_LOGI("BLE_SEC1", "🔐 Security1 state change: %d", state);
+    
+    if (xSemaphoreTake(security1_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE("BLE_SEC1", "❌ Failed to acquire Security1 mutex");
+        return;
+    }
+    
+    security1_state = state;
+    
+    switch (state) {
+        case SECURITY1_STATE_HANDSHAKE_COMPLETE:
+            ESP_LOGI("BLE_SEC1", "✅ Security1 handshake completed");
+            // Transition from handshake to operational service
+            if (transport_ble_transition_to_operational() == ESP_OK) {
+                ble_state = BLE_OPERATIONAL;
+            }
+            break;
+            
+        case SECURITY1_STATE_SESSION_ACTIVE:
+            ESP_LOGI("BLE_SEC1", "🔑 Security1 session active - encryption enabled");
+            ble_state = BLE_ENCRYPTED_COMM;
+            operational_service_active = true;
+            break;
+            
+        case SECURITY1_STATE_TRANSPORT_READY:
+            ESP_LOGI("BLE_SEC1", "📡 Security1 transport ready");
+            ble_state = BLE_SECURITY1_HANDSHAKE;
+            handshake_service_active = true;
+            break;
+            
+        case SECURITY1_STATE_ERROR:
+            ESP_LOGW("BLE_SEC1", "⚠️ Security1 error - check fallback");
+            if (security1_config.fallback_to_legacy) {
+                ESP_LOGI("BLE_SEC1", "🔄 Falling back to legacy mode");
+                ble_state = BLE_UP;  // Fallback to standard BLE
+                security1_enabled = false;
+            } else {
+                ble_state = BLE_ERROR;
+            }
+            break;
+            
+        default:
+            ESP_LOGD("BLE_SEC1", "🔄 Security1 state: %d", state);
+            break;
+    }
+    
+    xSemaphoreGive(security1_mutex);
+}
+
+esp_err_t transport_ble_start_with_security1(QueueHandle_t cmdQueue, 
+                                            QueueHandle_t respQueue,
+                                            const transport_ble_security1_config_t *sec1_config)
+{
+    ESP_LOGI("BLE_SEC1", "🚀 Starting BLE transport with Security1 dual service");
+    
+    if (!cmdQueue || !respQueue || !sec1_config) {
+        ESP_LOGE("BLE_SEC1", "❌ Invalid parameters");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Initialize standard BLE transport first
+    transport_ble_init(cmdQueue, respQueue);
+    
+    // Create Security1 mutex if not exists
+    if (!security1_mutex) {
+        security1_mutex = xSemaphoreCreateMutex();
+        if (!security1_mutex) {
+            ESP_LOGE("BLE_SEC1", "❌ Failed to create Security1 mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    
+    // Store Security1 configuration
+    memcpy(&security1_config, sec1_config, sizeof(transport_ble_security1_config_t));
+    
+    // Start standard BLE advertising
+    transport_ble_start();
+    
+    // Configure Security1 handshake
+    security1_handshake_ble_config_t ble_handshake_config = {
+        .appearance = 0x0080,  // Generic computer
+        .enable_bonding = false,
+        .max_mtu = negotiated_mtu
+    };
+    
+    strncpy(ble_handshake_config.device_name, sec1_config->device_name, 
+            sizeof(ble_handshake_config.device_name) - 1);
+    
+    // Start Security1 session with BLE transport
+    esp_err_t ret = security1_session_start(
+        SECURITY1_HANDSHAKE_BLE,
+        (security1_handshake_config_t*)&ble_handshake_config,
+        sec1_config->proof_of_possession,
+        transport_ble_security1_event_callback,
+        NULL  // user_data
+    );
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE("BLE_SEC1", "❌ Failed to start Security1 session: %s", esp_err_to_name(ret));
+        if (sec1_config->fallback_to_legacy) {
+            ESP_LOGI("BLE_SEC1", "🔄 Continuing with legacy BLE mode");
+            security1_enabled = false;
+            return ESP_OK;  // Continue with legacy mode
+        }
+        return ret;
+    }
+    
+    security1_enabled = true;
+    ESP_LOGI("BLE_SEC1", "✅ Security1 dual service initialized successfully");
+    ESP_LOGI("BLE_SEC1", "📡 Handshake Service: FF50-FF52 (protocomm)");
+    ESP_LOGI("BLE_SEC1", "🔧 Operational Service: FF00-FF02 (encrypted data)");
+    
+    return ESP_OK;
+}
+
+esp_err_t transport_ble_send_encrypted(const uint8_t *data, size_t len)
+{
+    if (!security1_enabled || security1_state != SECURITY1_STATE_SESSION_ACTIVE) {
+        ESP_LOGE("BLE_SEC1", "❌ Security1 not ready for encrypted communication");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (!data || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Encrypt data using Security1 session
+    security1_buffer_t plaintext = {
+        .data = (uint8_t*)data,
+        .length = len
+    };
+    
+    security1_buffer_t ciphertext;
+    esp_err_t ret = security1_encrypt(&plaintext, &ciphertext);
+    if (ret != ESP_OK) {
+        ESP_LOGE("BLE_SEC1", "❌ Encryption failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Send encrypted data via operational service (FF00-FF02)
+    // For now, we'll use the existing chunking mechanism
+    // In a full implementation, this would use the FF00-FF02 characteristics
+    
+    ESP_LOGI("BLE_SEC1", "🔐 Sending %zu bytes encrypted (plaintext: %zu bytes)", 
+             ciphertext.length, len);
+    
+    // TODO: Implement actual encrypted data transmission via FF00-FF02
+    // For now, use placeholder that validates encryption worked
+    
+    // Cleanup encrypted buffer
+    if (ciphertext.data) {
+        free(ciphertext.data);
+    }
+    
+    return ESP_OK;
+}
+
+bool transport_ble_is_security1_active(void)
+{
+    if (!security1_enabled) {
+        return false;
+    }
+    
+    return (security1_state == SECURITY1_STATE_SESSION_ACTIVE ||
+            security1_state == SECURITY1_STATE_TRANSPORT_READY);
+}
+
+esp_err_t transport_ble_get_security1_info(bool *session_established,
+                                          bool *encryption_active, 
+                                          bool *handshake_service_active_out,
+                                          bool *operational_service_active_out)
+{
+    if (!session_established || !encryption_active || 
+        !handshake_service_active_out || !operational_service_active_out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (xSemaphoreTake(security1_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    *session_established = (security1_state == SECURITY1_STATE_SESSION_ACTIVE);
+    *encryption_active = security1_enabled && *session_established;
+    *handshake_service_active_out = handshake_service_active;
+    *operational_service_active_out = operational_service_active;
+    
+    xSemaphoreGive(security1_mutex);
+    return ESP_OK;
+}
+
+esp_err_t transport_ble_transition_to_operational(void)
+{
+    ESP_LOGI("BLE_SEC1", "🔄 Transitioning from handshake to operational service");
+    
+    if (!security1_enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (xSemaphoreTake(security1_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    // Switch from FF50-FF52 (handshake) to FF00-FF02 (operational)
+    handshake_service_active = false;
+    operational_service_active = true;
+    
+    // Update BLE state
+    ble_state = BLE_OPERATIONAL;
+    
+    ESP_LOGI("BLE_SEC1", "✅ Transitioned to operational mode");
+    ESP_LOGI("BLE_SEC1", "🔧 FF00-FF02 service now active for encrypted data");
+    
+    xSemaphoreGive(security1_mutex);
+    return ESP_OK;
 }

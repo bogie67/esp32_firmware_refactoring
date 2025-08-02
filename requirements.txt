@@ -1,0 +1,21 @@
+# Security1 Test Suite Dependencies
+
+# BLE Support
+bleak>=0.21.0
+
+# MQTT Support  
+paho-mqtt>=1.6.0
+
+# WebSocket support for MQTT
+websocket-client>=1.6.0
+
+# Cryptography for Security1
+cryptography>=41.0.0
+
+# Serial communication (optional, for ESP32 monitoring)
+pyserial>=3.5
+
+# JSON handling (built-in)
+# asyncio (built-in)
+# struct (built-in)
+# logging (built-in)

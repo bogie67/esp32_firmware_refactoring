@@ -2,6 +2,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/event_groups.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "error_manager.h"
@@ -13,11 +14,16 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
+#include "security1_session.h"
 
 #include "solenoid.h"
 
 
 static const char *TAG = "APP_MAIN";
+
+// WiFi Event Group
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
 QueueHandle_t cmdQueue;
 QueueHandle_t respQueue_BLE;
 QueueHandle_t respQueue_MQTT;
@@ -50,9 +56,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "✅ WiFi connesso! IP: " IPSTR, IP2STR(&event->ip_info.ip));
         wifi_retry_num = 0;
         
-        // Avvia MQTT transport solo dopo aver ottenuto l'IP
-        ESP_LOGI(TAG, "🚀 Avvio transport MQTT dopo connessione WiFi");
-        transport_mqtt_start();
+        // Segnala al main task di avviare MQTT Security1
+        ESP_LOGI(TAG, "🚀 WiFi connesso - signaling MQTT Security1 start");
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
@@ -128,9 +134,21 @@ void app_main(void)
     respQueue_BLE = xQueueCreate(10, sizeof(resp_frame_t));
     respQueue_MQTT = xQueueCreate(10, sizeof(resp_frame_t));
 
+    // Crea Event Group per sincronizzazione WiFi
+    s_wifi_event_group = xEventGroupCreate();
+
     wifi_stack_init();
     cmd_proc_start();
     solenoid_init();
+    
+    // Inizializza framework Security1
+    ESP_LOGI(TAG, "🔐 Initializing Security1 framework");
+    esp_err_t sec1_init_ret = security1_session_init();
+    if (sec1_init_ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to initialize Security1 framework: %s", esp_err_to_name(sec1_init_ret));
+        return;
+    }
+    ESP_LOGI(TAG, "✅ Security1 framework initialized");
 
 #if CONFIG_MAIN_WITH_BLE
    smart_ble_transport_init(cmdQueue, respQueue_BLE);
@@ -138,4 +156,27 @@ void app_main(void)
 
     // Inizializza transport MQTT (start viene chiamato dopo connessione WiFi)
     transport_mqtt_init(cmdQueue, respQueue_MQTT);
+    
+    // Aspetta connessione WiFi e avvia MQTT Security1
+    ESP_LOGI(TAG, "⏳ Waiting for WiFi connection...");
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
+    
+    ESP_LOGI(TAG, "🚀 Starting MQTT Security1 transport");
+    
+    // Configurazione Security1 MQTT nel main task (stack più grande)
+    transport_mqtt_security1_config_t sec1_config = {
+        .broker_uri = CONFIG_MQTT_BROKER_URI,
+        .topic_prefix = "security1/esp32",
+        .client_id = "SmartDrip_ESP32_Sec1",
+        .proof_of_possession = "test_pop_12345",
+        .qos_level = 1,
+        .keepalive_interval = 60
+    };
+    
+    esp_err_t mqtt_ret = transport_mqtt_start_with_security1(cmdQueue, respQueue_MQTT, &sec1_config);
+    if (mqtt_ret != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to start MQTT Security1: %s", esp_err_to_name(mqtt_ret));
+    } else {
+        ESP_LOGI(TAG, "✅ MQTT Security1 started successfully");
+    }
 }

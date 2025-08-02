@@ -1,0 +1,244 @@
+menu "Security1 Session Configuration"
+
+    config SECURITY1_SESSION_ENABLE
+        bool "Enable Security1 Session Framework"
+        default y
+        help
+            Enable the Security1 session management framework for transport-agnostic
+            X25519 + PoP handshake and AES-CTR encryption.
+
+    menu "Default PoP Configuration"
+        depends on SECURITY1_SESSION_ENABLE
+
+        config SECURITY1_DEFAULT_POP_SOURCE
+            int "Default PoP Source"
+            range 0 2
+            default 0
+            help
+                Source for default Proof-of-Possession generation:
+                0: WiFi MAC address (AABBCCDDEEFF format)
+                1: Custom prefix + MAC (PREFIX-AABBCC format)
+                2: Manual configuration required
+
+        config SECURITY1_DEFAULT_POP_PREFIX
+            string "PoP Prefix (when using prefix + MAC)"
+            depends on SECURITY1_DEFAULT_POP_SOURCE = 1
+            default "ESP32"
+            help
+                Prefix string to prepend to MAC address for PoP generation.
+                Final format will be: PREFIX-AABBCC
+
+        config SECURITY1_MANUAL_POP
+            string "Manual PoP String"
+            depends on SECURITY1_DEFAULT_POP_SOURCE = 2
+            default "12345678"
+            help
+                Manually configured Proof-of-Possession string.
+                Must be 6-64 characters long.
+
+    endmenu
+
+    menu "BLE Handshake Configuration"
+        depends on SECURITY1_SESSION_ENABLE
+
+        config SECURITY1_BLE_ENABLE
+            bool "Enable BLE Handshake Transport"
+            default y
+            depends on BT_ENABLED
+            help
+                Enable BLE transport for Security1 handshake using protocomm_ble.
+
+        config SECURITY1_BLE_DEFAULT_DEVICE_NAME
+            string "Default BLE Device Name"
+            depends on SECURITY1_BLE_ENABLE
+            default "SmartDrip-Sec1"
+            help
+                Default device name used in BLE advertising for handshake.
+
+        config SECURITY1_BLE_DEFAULT_MTU
+            int "Default BLE MTU"
+            depends on SECURITY1_BLE_ENABLE
+            range 23 2048
+            default 512
+            help
+                Default MTU size for BLE handshake transport.
+
+        config SECURITY1_BLE_ADV_INTERVAL_MIN
+            int "BLE Advertising Interval Min (ms)"
+            depends on SECURITY1_BLE_ENABLE
+            range 20 10240
+            default 100
+            help
+                Minimum advertising interval in milliseconds.
+
+        config SECURITY1_BLE_ADV_INTERVAL_MAX
+            int "BLE Advertising Interval Max (ms)"
+            depends on SECURITY1_BLE_ENABLE
+            range 20 10240
+            default 200
+            help
+                Maximum advertising interval in milliseconds.
+
+        config SECURITY1_BLE_CONNECTION_TIMEOUT
+            int "BLE Connection Timeout (ms)"
+            depends on SECURITY1_BLE_ENABLE
+            range 1000 30000
+            default 10000
+            help
+                Timeout for BLE connection establishment in milliseconds.
+
+    endmenu
+
+    menu "MQTT Handshake Configuration"
+        depends on SECURITY1_SESSION_ENABLE
+
+        config SECURITY1_MQTT_ENABLE
+            bool "Enable MQTT Handshake Transport"
+            default y
+            depends on ESP_MQTT_ENABLED
+            help
+                Enable MQTT transport for Security1 handshake using custom protocomm_mqtt.
+
+        config SECURITY1_MQTT_DEFAULT_BROKER_URI
+            string "Default MQTT Broker URI"
+            depends on SECURITY1_MQTT_ENABLE
+            default "mqtt://192.168.1.100:1883"
+            help
+                Default MQTT broker URI for handshake transport.
+
+        config SECURITY1_MQTT_DEFAULT_TOPIC_PREFIX
+            string "Default MQTT Topic Prefix"
+            depends on SECURITY1_MQTT_ENABLE
+            default "smartdrip/proto"
+            help
+                Default topic prefix for MQTT handshake.
+                Full topics will be: prefix/rx and prefix/tx
+
+        config SECURITY1_MQTT_DEFAULT_QOS
+            int "Default MQTT QoS Level"
+            depends on SECURITY1_MQTT_ENABLE
+            range 0 2
+            default 1
+            help
+                Default QoS level for MQTT handshake messages.
+
+        config SECURITY1_MQTT_KEEPALIVE_INTERVAL
+            int "MQTT Keepalive Interval (seconds)"
+            depends on SECURITY1_MQTT_ENABLE
+            range 10 300
+            default 60
+            help
+                MQTT keepalive interval in seconds.
+
+        config SECURITY1_MQTT_CONNECT_TIMEOUT
+            int "MQTT Connection Timeout (ms)"
+            depends on SECURITY1_MQTT_ENABLE
+            range 1000 30000
+            default 10000
+            help
+                Timeout for MQTT broker connection in milliseconds.
+
+        config SECURITY1_MQTT_MAX_PAYLOAD_SIZE
+            int "Maximum MQTT Payload Size (bytes)"
+            depends on SECURITY1_MQTT_ENABLE
+            range 256 8192
+            default 4096
+            help
+                Maximum size for MQTT handshake messages.
+
+    endmenu
+
+    menu "Crypto Configuration"
+        depends on SECURITY1_SESSION_ENABLE
+
+        config SECURITY1_SESSION_KEY_CACHE_TIME
+            int "Session Key Cache Time (seconds)"
+            range 300 86400
+            default 3600
+            help
+                Maximum time to cache session key before requiring re-handshake.
+                Set to 0 to disable automatic expiration.
+
+        config SECURITY1_ENCRYPTION_OVERHEAD
+            int "Encryption Overhead (bytes)"
+            range 32 128
+            default 64
+            help
+                Additional bytes added during encryption for IV, MAC and padding.
+                Used for buffer size calculations.
+
+        config SECURITY1_ENABLE_SESSION_REUSE
+            bool "Enable Session Key Reuse"
+            default y
+            help
+                Allow reusing the same session key across multiple transport restarts
+                within the cache time period.
+
+    endmenu
+
+    menu "Debugging and Diagnostics"
+        depends on SECURITY1_SESSION_ENABLE
+
+        config SECURITY1_ENABLE_STATS
+            bool "Enable Statistics Collection"
+            default y
+            help
+                Enable collection of detailed statistics for handshake and crypto operations.
+
+        config SECURITY1_ENABLE_DEBUG_LOGS
+            bool "Enable Debug Logging"
+            default n
+            help
+                Enable verbose debug logging for Security1 operations.
+                WARNING: May expose sensitive crypto material in logs.
+
+        config SECURITY1_ENABLE_SESSION_KEY_EXPORT
+            bool "Enable Session Key Export (DEBUG ONLY)"
+            default n
+            help
+                Enable API to export session key for debugging.
+                WARNING: Security risk, use only for development!
+
+        config SECURITY1_STATS_RESET_ON_ERROR
+            bool "Reset Statistics on Error"
+            default y
+            help
+                Automatically reset statistics when session enters error state.
+
+    endmenu
+
+    menu "Memory and Performance"
+        depends on SECURITY1_SESSION_ENABLE
+
+        config SECURITY1_TASK_STACK_SIZE
+            int "Task Stack Size (bytes)"
+            range 2048 8192
+            default 4096
+            help
+                Stack size for internal Security1 tasks.
+
+        config SECURITY1_TASK_PRIORITY
+            int "Task Priority"
+            range 1 25
+            default 5
+            help
+                Priority for internal Security1 tasks.
+
+        config SECURITY1_MUTEX_TIMEOUT_MS
+            int "Mutex Timeout (ms)"
+            range 100 5000
+            default 1000
+            help
+                Timeout for acquiring internal mutexes.
+
+        config SECURITY1_MAX_CONCURRENT_SESSIONS
+            int "Maximum Concurrent Sessions"
+            range 1 5
+            default 1
+            help
+                Maximum number of concurrent Security1 sessions.
+                Currently only 1 is supported.
+
+    endmenu
+
+endmenu

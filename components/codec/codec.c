@@ -85,6 +85,19 @@ bool decode_json_command(const char *json_data, size_t len, cmd_frame_t *out)
     cJSON *id = cJSON_GetObjectItem(json, "id");
     cJSON *op = cJSON_GetObjectItem(json, "op");
     
+    // Debug detailed parsing
+    ESP_LOGI("CODEC", "🔍 Parsing fields: id=%p, op=%p", id, op);
+    if (id) {
+        ESP_LOGI("CODEC", "🔍 id type: %s, value: %d", cJSON_IsNumber(id) ? "number" : "not_number", id->valueint);
+    } else {
+        ESP_LOGE("CODEC", "❌ id field not found in JSON");
+    }
+    if (op) {
+        ESP_LOGI("CODEC", "🔍 op type: %s, value: %s", cJSON_IsString(op) ? "string" : "not_string", op->valuestring);
+    } else {
+        ESP_LOGE("CODEC", "❌ op field not found in JSON");
+    }
+    
     if (!cJSON_IsNumber(id) || !cJSON_IsString(op)) {
         ESP_LOGE("CODEC", "❌ Missing required fields id or op");
         cJSON_Delete(json);

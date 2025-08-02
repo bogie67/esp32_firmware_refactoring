@@ -14,15 +14,22 @@ extern "C" {
 /* BLE transport component - API unified with transport_mqtt */
 
 /**
- * @brief Stato del transport BLE
+ * @brief Stato del transport BLE (Enhanced per Security1)
  */
 typedef enum {
-    BLE_DOWN = 0,     ///< BLE non inizializzato o fermato
-    BLE_STARTING,     ///< Inizializzazione BLE stack in corso
-    BLE_ADVERTISING,  ///< In advertising, nessun client connesso
-    BLE_UP,          ///< Client connesso, GATT operativo e funzionante
-    BLE_BUSY,        ///< Operazione in corso (MTU exchange, pairing)
-    BLE_ERROR        ///< Errore critico, richiede restart
+    BLE_DOWN = 0,                    ///< BLE non inizializzato o fermato
+    BLE_STARTING,                    ///< Inizializzazione BLE stack in corso
+    BLE_ADVERTISING,                 ///< In advertising, nessun client connesso
+    BLE_UP,                         ///< Client connesso, GATT operativo e funzionante
+    BLE_BUSY,                       ///< Operazione in corso (MTU exchange, pairing)
+    
+    // NEW: Security1 states
+    BLE_SECURITY1_HANDSHAKE,        ///< Security1 handshake in corso (FF50-FF52)
+    BLE_SECURITY1_READY,            ///< Security1 session stabilita
+    BLE_OPERATIONAL,                ///< Servizio operativo attivo (FF00-FF02)
+    BLE_ENCRYPTED_COMM,             ///< Comunicazione crittografata attiva
+    
+    BLE_ERROR                       ///< Errore critico, richiede restart
 } ble_state_t;
 
 /**
@@ -98,6 +105,74 @@ ble_state_t transport_ble_get_state(void);
  * Libera memoria, ferma tasks, deinit NimBLE stack
  */
 void transport_ble_cleanup(void);
+
+/* ──────────────── Security1 Integration API ──────────────── */
+
+/**
+ * @brief Configurazione Security1 per transport BLE
+ */
+typedef struct {
+    char device_name[32];              ///< Nome device per advertising
+    char proof_of_possession[64];      ///< PoP per handshake Security1
+    uint16_t handshake_timeout_ms;     ///< Timeout handshake (default: 30000ms)
+    bool enable_encryption;            ///< Abilita crittografia sessione
+    bool fallback_to_legacy;          ///< Fallback a modalità legacy se handshake fallisce
+} transport_ble_security1_config_t;
+
+/**
+ * @brief Avvia transport BLE con supporto Security1 (Dual Service)
+ * 
+ * Inizializza sia il servizio handshake (FF50-FF52) che operativo (FF00-FF02)
+ * 
+ * @param cmdQueue Queue per comandi
+ * @param respQueue Queue per risposte  
+ * @param sec1_config Configurazione Security1
+ * @return esp_err_t ESP_OK se avvio riuscito
+ */
+esp_err_t transport_ble_start_with_security1(QueueHandle_t cmdQueue, 
+                                            QueueHandle_t respQueue,
+                                            const transport_ble_security1_config_t *sec1_config);
+
+/**
+ * @brief Invia dati crittografati via BLE
+ * 
+ * Utilizza la sessione Security1 per crittografare i dati prima dell'invio
+ * 
+ * @param data Dati da inviare
+ * @param len Lunghezza dati
+ * @return esp_err_t ESP_OK se invio riuscito
+ */
+esp_err_t transport_ble_send_encrypted(const uint8_t *data, size_t len);
+
+/**
+ * @brief Verifica se Security1 è attivo
+ * 
+ * @return true se sessione Security1 stabilita e operativa
+ */
+bool transport_ble_is_security1_active(void);
+
+/**
+ * @brief Ottieni informazioni sessione Security1
+ * 
+ * @param session_established Output: true se sessione stabilita
+ * @param encryption_active Output: true se crittografia attiva
+ * @param handshake_service_active Output: true se servizio FF50-FF52 attivo
+ * @param operational_service_active Output: true se servizio FF00-FF02 attivo
+ * @return esp_err_t ESP_OK se informazioni ottenute
+ */
+esp_err_t transport_ble_get_security1_info(bool *session_established,
+                                          bool *encryption_active, 
+                                          bool *handshake_service_active,
+                                          bool *operational_service_active);
+
+/**
+ * @brief Forza transizione a modalità operativa
+ * 
+ * Switch dal servizio handshake (FF50-FF52) al servizio operativo (FF00-FF02)
+ * 
+ * @return esp_err_t ESP_OK se transizione riuscita
+ */
+esp_err_t transport_ble_transition_to_operational(void);
 
 /**
  * @brief Configura parametri di chunking (opzionale)
