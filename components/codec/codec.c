@@ -1,7 +1,9 @@
 #include "codec.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include "esp_log.h"
+#include "cJSON.h"
 
 bool decode_ble_frame(const uint8_t *data, size_t len, cmd_frame_t *out)
 {
@@ -53,4 +55,98 @@ uint8_t *encode_ble_resp(const resp_frame_t *r, size_t *outLen)
 
     *outLen = total;
     return buf;
+}
+
+// JSON support for MQTT transport
+bool decode_json_command(const char *json_data, size_t len, cmd_frame_t *out)
+{
+    memset(out, 0, sizeof(cmd_frame_t));
+    
+    // Ensure null termination for cJSON
+    char *json_str = malloc(len + 1);
+    if (!json_str) {
+        ESP_LOGE("CODEC", "❌ Memoria insufficiente per JSON string");
+        return false;
+    }
+    memcpy(json_str, json_data, len);
+    json_str[len] = '\0';
+    
+    ESP_LOGI("CODEC", "🔍 Decode JSON: %s", json_str);
+    
+    cJSON *json = cJSON_Parse(json_str);
+    free(json_str);
+    
+    if (!json) {
+        ESP_LOGE("CODEC", "❌ JSON parse error");
+        return false;
+    }
+    
+    // Parse required fields
+    cJSON *id = cJSON_GetObjectItem(json, "id");
+    cJSON *op = cJSON_GetObjectItem(json, "op");
+    
+    if (!cJSON_IsNumber(id) || !cJSON_IsString(op)) {
+        ESP_LOGE("CODEC", "❌ Missing required fields id or op");
+        cJSON_Delete(json);
+        return false;
+    }
+    
+    out->id = (uint16_t)id->valueint;
+    strncpy(out->op, op->valuestring, sizeof(out->op) - 1);
+    out->op[sizeof(out->op) - 1] = '\0';
+    
+    // Parse optional payload
+    cJSON *payload = cJSON_GetObjectItem(json, "payload");
+    if (payload && cJSON_IsString(payload)) {
+        size_t payload_len = strlen(payload->valuestring);
+        if (payload_len > 0) {
+            out->payload = malloc(payload_len + 1);
+            if (out->payload) {
+                strcpy((char*)out->payload, payload->valuestring);
+                out->len = payload_len;
+            }
+        }
+    }
+    
+    cJSON_Delete(json);
+    ESP_LOGI("CODEC", "✅ JSON parsed: id=%u, op=%s, payload_len=%u", 
+             out->id, out->op, out->len);
+    return true;
+}
+
+char *encode_json_response(const resp_frame_t *r)
+{
+    cJSON *json = cJSON_CreateObject();
+    if (!json) {
+        ESP_LOGE("CODEC", "❌ Failed to create JSON object");
+        return NULL;
+    }
+    
+    cJSON_AddNumberToObject(json, "id", r->id);
+    cJSON_AddNumberToObject(json, "status", r->status);
+    cJSON_AddBoolToObject(json, "is_final", r->is_final);
+    
+    if (r->len > 0 && r->payload) {
+        // Assume payload is string for JSON
+        char *payload_str = malloc(r->len + 1);
+        if (payload_str) {
+            memcpy(payload_str, r->payload, r->len);
+            payload_str[r->len] = '\0';
+            cJSON_AddStringToObject(json, "payload", payload_str);
+            free(payload_str);
+        }
+    } else {
+        cJSON_AddNullToObject(json, "payload");
+    }
+    
+    char *json_string = cJSON_Print(json);
+    cJSON_Delete(json);
+    
+    if (json_string) {
+        ESP_LOGI("CODEC", "✅ JSON response encoded: %s", json_string);
+    } else {
+        ESP_LOGE("CODEC", "❌ Failed to encode JSON response");
+    }
+    
+    return json_string;
 }

@@ -2,20 +2,38 @@ menu "MQTT Transport Configuration"
 
     config MQTT_BROKER_URI
         string "MQTT broker URI"
-        default "mqtt://192.168.1.10"
+        default "ws://broker.emqx.io:8083/mqtt"
         help
             URI of the MQTT broker to connect to.
             Examples:
-            - mqtt://192.168.1.10 (plain MQTT)
+            - mqtt://broker.emqx.io (plain MQTT)
             - mqtts://broker.hivemq.com (secure MQTT)
-            - mqtt://user:pass@192.168.1.10 (with authentication)
+            - ws://broker.emqx.io/mqtt (WebSocket MQTT)
+            - wss://broker.emqx.io/mqtt (Secure WebSocket MQTT)
 
-    config MQTT_BROKER_PORT
-        int "MQTT broker port" 
-        default 1883
+    config MQTT_BACKOFF_INITIAL_MS
+        int "Reconnect back-off - primo tentativo (ms)"
+        default 1000
+        range 100 10000
         help
-            Port number for MQTT broker connection.
-            Standard ports: 1883 (plain), 8883 (secure)
+            Initial delay before first reconnection attempt in milliseconds.
+
+    config MQTT_BACKOFF_MAX_MS
+        int "Reconnect back-off - massimo (ms)"
+        default 32000
+        range 1000 300000
+        help
+            Maximum delay between reconnection attempts in milliseconds.
+
+    config MQTT_PROTOCOL_VERSION
+        int "MQTT protocol version"
+        default 5
+        range 3 5
+        help
+            MQTT protocol version to use:
+            3 = MQTT v3.1
+            4 = MQTT v3.1.1
+            5 = MQTT v5.0 (recommended)
 
     config MQTT_KEEPALIVE_INTERVAL
         int "MQTT keepalive interval (seconds)"
@@ -45,5 +63,19 @@ menu "MQTT Transport Configuration"
             0 = At most once
             1 = At least once  
             2 = Exactly once
+
+    config MQTT_CLEAN_SESSION
+        bool "MQTT clean session"
+        default y
+        help
+            Start with a clean session (recommended for v5.0)
+
+    config MQTT_SESSION_EXPIRY_INTERVAL
+        int "MQTT v5 session expiry interval (seconds)"
+        default 3600
+        range 0 4294967295
+        depends on MQTT_PROTOCOL_VERSION >= 5
+        help
+            Session expiry interval for MQTT v5.0 (0 = no expiry)
 
 endmenu

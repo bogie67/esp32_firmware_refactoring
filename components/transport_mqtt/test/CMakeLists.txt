@@ -1,0 +1,20 @@
+idf_component_register(
+    SRCS
+        "test_transport_api.c"
+        "test_mqtt_events.c"
+        "test_message_routing.c"
+        "test_backoff.c"
+        "mocks/mock_mqtt_client.c"
+    INCLUDE_DIRS 
+        "."
+        "mocks"
+    REQUIRES 
+        unity
+        transport_mqtt
+        protocol_types
+        freertos
+    PRIV_REQUIRES
+        esp_event
+        mqtt
+        esp_timer
+)

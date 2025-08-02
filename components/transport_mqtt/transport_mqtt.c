@@ -1,6 +1,8 @@
 #include "transport_mqtt.h"
 #include "esp_log.h"
 #include "esp_event.h"
+#include "esp_timer.h"
+#include "esp_random.h"
 #include "mqtt_client.h"
 #include "cmd_frame.h"
 #include "resp_frame.h"
@@ -10,16 +12,66 @@
 #include <stdlib.h>
 #include <inttypes.h>
 
-static const char *TAG = "TRANSPORT_MQTT";
+static const char *TAG = "MQTT_TR";
 
 // Client MQTT e configurazione
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static QueueHandle_t cmd_queue = NULL;
 static QueueHandle_t resp_queue = NULL;
-static bool is_connected = false;
+
+// State machine e reconnection logic
+static mqtt_state_t mqtt_state = MQTT_DOWN;
+static esp_timer_handle_t reconnect_timer = NULL;
+static uint32_t backoff_delay_ms = CONFIG_MQTT_BACKOFF_INITIAL_MS;
 
 // Task handle per il task TX
 static TaskHandle_t tx_task_handle = NULL;
+
+/* ---------- Back-off reconnection helpers ---------- */
+
+/**
+ * @brief Schedula un tentativo di riconnessione con back-off exponential + jitter
+ */
+static void schedule_reconnect(void)
+{
+    if (esp_timer_is_active(reconnect_timer)) {
+        ESP_LOGD(TAG, "⏰ Timer riconnessione già attivo");
+        return;  // Timer già schedulato
+    }
+    
+    // Jitter ±10% per evitare thundering herd
+    uint32_t jitter = esp_random() % (backoff_delay_ms / 10);
+    uint32_t total_delay = backoff_delay_ms + jitter;
+    
+    ESP_LOGW(TAG, "🔄 Re-connect in %" PRIu32 " ms (backoff: %" PRIu32 " + jitter: %" PRIu32 ")", 
+             total_delay, backoff_delay_ms, jitter);
+    
+    // Avvia timer one-shot
+    esp_err_t err = esp_timer_start_once(reconnect_timer, total_delay * 1000ULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Errore avvio timer riconnessione: %s", esp_err_to_name(err));
+        return;
+    }
+    
+    // Raddoppia back-off per prossimo tentativo (con limite massimo)
+    backoff_delay_ms = (backoff_delay_ms * 2 > CONFIG_MQTT_BACKOFF_MAX_MS) 
+                       ? CONFIG_MQTT_BACKOFF_MAX_MS 
+                       : backoff_delay_ms * 2;
+}
+
+/**
+ * @brief Callback timer per tentativo riconnessione
+ */
+static void reconnect_timer_callback(void *arg)
+{
+    ESP_LOGI(TAG, "🔄 Tentativo riconnessione MQTT...");
+    
+    esp_err_t err = esp_mqtt_client_reconnect(mqtt_client);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "⚠️ Riconnessione fallita: %s", esp_err_to_name(err));
+        // Il fallimento triggererà MQTT_EVENT_ERROR che ri-schedulerà
+    }
+}
 
 /**
  * @brief Task per inviare risposte MQTT dal respQueue
@@ -40,38 +92,40 @@ static void mqtt_tx_task(void *arg)
                 continue;
             }
             
-            if (!is_connected) {
-                ESP_LOGW(TAG, "⚠️ MQTT non connesso, risposta persa");
+            // Controlla stato MQTT prima di inviare
+            if (mqtt_state != MQTT_UP) {
+                ESP_LOGW(TAG, "⚠️ MQTT down - scartando risposta id=%u", resp.id);
                 if (resp.is_final && resp.payload) {
                     free(resp.payload);
                 }
                 continue;
             }
             
-            // Encode della risposta (usa codec BLE per ora)
-            size_t encoded_len;
-            uint8_t *encoded_data = encode_ble_resp(&resp, &encoded_len);
+            // Encode della risposta JSON per MQTT
+            char *json_response = encode_json_response(&resp);
             
-            if (encoded_data) {
+            if (json_response) {
+                size_t json_len = strlen(json_response);
+                
                 // Pubblica sul topic di risposta
                 int msg_id = esp_mqtt_client_publish(
                     mqtt_client,
                     CONFIG_MQTT_RESP_TOPIC,
-                    (char*)encoded_data,
-                    (int)encoded_len,
+                    json_response,
+                    (int)json_len,
                     CONFIG_MQTT_QOS_LEVEL,
                     false
                 );
                 
                 if (msg_id >= 0) {
-                    ESP_LOGI(TAG, "✅ Risposta MQTT pubblicata (msg_id=%d, len=%zu)", msg_id, encoded_len);
+                    ESP_LOGI(TAG, "✅ Risposta MQTT JSON pubblicata (msg_id=%d, len=%zu)", msg_id, json_len);
                 } else {
                     ESP_LOGE(TAG, "❌ Errore pubblicazione risposta MQTT");
                 }
                 
-                free(encoded_data);
+                free(json_response);
             } else {
-                ESP_LOGE(TAG, "❌ Errore encoding risposta");
+                ESP_LOGE(TAG, "❌ Errore encoding risposta JSON");
             }
             
             // Cleanup payload se finale
@@ -91,8 +145,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     
     switch (event_id) {
         case MQTT_EVENT_CONNECTED:
-            ESP_LOGI(TAG, "🔗 MQTT connesso al broker");
-            is_connected = true;
+            ESP_LOGI(TAG, "✅ MQTT_CONNECTED - Broker raggiunto");
+            mqtt_state = MQTT_UP;
+            
+            // Reset back-off su connessione riuscita
+            backoff_delay_ms = CONFIG_MQTT_BACKOFF_INITIAL_MS;
+            
+            // Ferma timer riconnessione se attivo
+            if (esp_timer_is_active(reconnect_timer)) {
+                esp_timer_stop(reconnect_timer);
+                ESP_LOGD(TAG, "⏰ Timer riconnessione fermato");
+            }
             
             // Subscribe al topic dei comandi
             int msg_id = esp_mqtt_client_subscribe(mqtt_client, CONFIG_MQTT_CMD_TOPIC, CONFIG_MQTT_QOS_LEVEL);
@@ -100,8 +163,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             break;
             
         case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "🔌 MQTT disconnesso");
-            is_connected = false;
+            ESP_LOGW(TAG, "❌ MQTT_DISCONNECTED - Connessione persa");
+            mqtt_state = MQTT_DOWN;
+            schedule_reconnect();
+            break;
+            
+        case MQTT_EVENT_ERROR:
+            ESP_LOGW(TAG, "❌ MQTT_ERROR - Errore di connessione");
+            mqtt_state = MQTT_DOWN;
+            schedule_reconnect();
             break;
             
         case MQTT_EVENT_SUBSCRIBED:
@@ -121,9 +191,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             
             // Verifica che sia sul topic comandi
             if (strncmp(event->topic, CONFIG_MQTT_CMD_TOPIC, event->topic_len) == 0) {
-                // Decode del comando (usa codec BLE per ora)
+                // Decode del comando JSON per MQTT
                 cmd_frame_t cmd;
-                if (decode_ble_frame((uint8_t*)event->data, event->data_len, &cmd)) {
+                if (decode_json_command((char*)event->data, event->data_len, &cmd)) {
                     // Imposta origin MQTT
                     cmd.origin = ORIGIN_MQTT;
                     
@@ -138,13 +208,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         }
                     }
                 } else {
-                    ESP_LOGE(TAG, "❌ Errore decode comando MQTT");
+                    ESP_LOGE(TAG, "❌ Errore decode comando MQTT JSON");
                 }
             }
-            break;
-            
-        case MQTT_EVENT_ERROR:
-            ESP_LOGE(TAG, "❌ Errore MQTT: %s", strerror(event->error_handle->esp_transport_sock_errno));
             break;
             
         default:
@@ -191,10 +257,23 @@ void transport_mqtt_init(QueueHandle_t cmdQueue, QueueHandle_t respQueue)
     // Registra handler eventi
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     
+    // Crea timer per riconnessione con back-off
+    const esp_timer_create_args_t timer_args = {
+        .callback = &reconnect_timer_callback,
+        .name = "mqtt_reconn"
+    };
+    esp_err_t err = esp_timer_create(&timer_args, &reconnect_timer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Errore creazione timer riconnessione: %s", esp_err_to_name(err));
+        return;
+    }
+    
     ESP_LOGI(TAG, "✅ Transport MQTT inizializzato");
     ESP_LOGI(TAG, "🌐 Broker: %s", CONFIG_MQTT_BROKER_URI);
     ESP_LOGI(TAG, "📋 Topic CMD: %s", CONFIG_MQTT_CMD_TOPIC);
     ESP_LOGI(TAG, "📤 Topic RESP: %s", CONFIG_MQTT_RESP_TOPIC);
+    ESP_LOGI(TAG, "⚙️ Back-off: %" PRIu32 "-%" PRIu32 " ms", 
+             (uint32_t)CONFIG_MQTT_BACKOFF_INITIAL_MS, (uint32_t)CONFIG_MQTT_BACKOFF_MAX_MS);
 }
 
 void transport_mqtt_start(void)
@@ -235,6 +314,11 @@ void transport_mqtt_stop(void)
 {
     ESP_LOGI(TAG, "🛑 Arresto transport MQTT");
     
+    // Ferma timer riconnessione
+    if (reconnect_timer && esp_timer_is_active(reconnect_timer)) {
+        esp_timer_stop(reconnect_timer);
+    }
+    
     if (tx_task_handle) {
         vTaskDelete(tx_task_handle);
         tx_task_handle = NULL;
@@ -242,7 +326,7 @@ void transport_mqtt_stop(void)
     
     if (mqtt_client) {
         esp_mqtt_client_stop(mqtt_client);
-        is_connected = false;
+        mqtt_state = MQTT_DOWN;
     }
     
     ESP_LOGI(TAG, "✅ Transport MQTT arrestato");
@@ -250,7 +334,12 @@ void transport_mqtt_stop(void)
 
 bool transport_mqtt_is_connected(void)
 {
-    return is_connected;
+    return (mqtt_state == MQTT_UP);
+}
+
+mqtt_state_t transport_mqtt_get_state(void)
+{
+    return mqtt_state;
 }
 
 void transport_mqtt_cleanup(void)
@@ -259,14 +348,22 @@ void transport_mqtt_cleanup(void)
     
     transport_mqtt_stop();
     
+    // Cleanup timer riconnessione
+    if (reconnect_timer) {
+        esp_timer_delete(reconnect_timer);
+        reconnect_timer = NULL;
+    }
+    
     if (mqtt_client) {
         esp_mqtt_client_destroy(mqtt_client);
         mqtt_client = NULL;
     }
     
+    // Reset stato
     cmd_queue = NULL;
     resp_queue = NULL;
-    is_connected = false;
+    mqtt_state = MQTT_DOWN;
+    backoff_delay_ms = CONFIG_MQTT_BACKOFF_INITIAL_MS;
     
     ESP_LOGI(TAG, "✅ Cleanup transport MQTT completato");
 }

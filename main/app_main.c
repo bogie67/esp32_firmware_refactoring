@@ -22,17 +22,77 @@ QueueHandle_t respQueue;
 
 // Task rimosso - ora usiamo cmd_proc_start() da cmd_proc_task.c
 
+// Configurazione WiFi
+// TODO: Implementare WiFi provisioning per configurazione dinamica delle credenziali
+#define WIFI_SSID "BogieMobile"
+#define WIFI_PASS "p@ssworD"
+#define WIFI_MAXIMUM_RETRY 5
+
+static int wifi_retry_num = 0;
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (wifi_retry_num < WIFI_MAXIMUM_RETRY) {
+            esp_wifi_connect();
+            wifi_retry_num++;
+            ESP_LOGI(TAG, "🔄 Retry connessione WiFi (%d/%d)", wifi_retry_num, WIFI_MAXIMUM_RETRY);
+        } else {
+            ESP_LOGE(TAG, "❌ Connessione WiFi fallita dopo %d tentativi", WIFI_MAXIMUM_RETRY);
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "✅ WiFi connesso! IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        wifi_retry_num = 0;
+        
+        // Avvia MQTT transport solo dopo aver ottenuto l'IP
+        ESP_LOGI(TAG, "🚀 Avvio transport MQTT dopo connessione WiFi");
+        transport_mqtt_start();
+    }
+}
+
 static void wifi_stack_init(void)
 {
     esp_netif_init();
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_sta();
 
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = true,
+                .required = false
+            },
+        },
+    };
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "🌐 WiFi configurato per SSID: %s", WIFI_SSID);
 }
 
 
@@ -65,7 +125,6 @@ void app_main(void)
    smart_ble_transport_init(cmdQueue, respQueue);
 #endif
 
-    // Inizializza e avvia transport MQTT
+    // Inizializza transport MQTT (start viene chiamato dopo connessione WiFi)
     transport_mqtt_init(cmdQueue, respQueue);
-    transport_mqtt_start();
 }
