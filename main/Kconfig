@@ -1,0 +1,8 @@
+menu "Main Component Options"
+    config MAIN_WITH_BLE
+        bool "Enable NimBLE in main component"
+        default y
+        help
+            Untick when building unit-test-app to skip NimBLE initialization.
+            This prevents crashes during Unity testing.
+endmenu

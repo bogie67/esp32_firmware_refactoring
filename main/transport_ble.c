@@ -11,6 +11,7 @@
 #include "string.h"
 #include "nvs_flash.h"
 
+#if CONFIG_MAIN_WITH_BLE
 /* NimBLE */
 #include "esp_nimble_hci.h"
 #include "nimble/nimble_port.h"
@@ -19,12 +20,15 @@
 #include "host/ble_gap.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+#endif
 
 #define DEVICE_NAME "SMART_DRIP"
 
 /* ──────────────── Queue handles ──────────────── */
 static QueueHandle_t cmdQ  = NULL;
 static QueueHandle_t respQ = NULL;
+
+#if CONFIG_MAIN_WITH_BLE
 
 /* ──────────────── UUIDs ──────────────── */
 static const ble_uuid16_t svc_uuid = BLE_UUID16_INIT(0x00FF);
@@ -248,9 +252,12 @@ static void host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
+#endif /* CONFIG_MAIN_WITH_BLE */
+
 /* ──────────────── API pubblica ──────────────── */
 void smart_ble_transport_init(QueueHandle_t cQ, QueueHandle_t rQ)
 {
+#if CONFIG_MAIN_WITH_BLE
     cmdQ  = cQ;
     respQ = rQ;
 
@@ -266,4 +273,10 @@ void smart_ble_transport_init(QueueHandle_t cQ, QueueHandle_t rQ)
     xTaskCreate(tx_task, "ble_tx_task", 4096, NULL, 5, NULL);
 
     ESP_LOGI("BLE_NIMBLE", "Transport inizializzato (NimBLE)");
+#else
+    /* Stub per i test Unity */
+    ESP_LOGI("BLE_NIMBLE", "BLE disabled for testing - stub implementation");
+    (void)cQ;
+    (void)rQ;
+#endif
 }

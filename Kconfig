@@ -1,0 +1,7 @@
+menu "Main options"
+    config MAIN_WITH_BLE
+        bool "Enable NimBLE in main component"
+        default y
+        help
+            Untick when building unit-test-app to skip NimBLE init
+endmenu

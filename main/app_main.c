@@ -55,5 +55,7 @@ void app_main(void)
     cmd_proc_start();
     solenoid_init();
 
-    smart_ble_transport_init(cmdQueue, respQueue);
+#if CONFIG_MAIN_WITH_BLE
+   smart_ble_transport_init(cmdQueue, respQueue);
+#endif
 }

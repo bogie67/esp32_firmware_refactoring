@@ -26,11 +26,13 @@ jobs:
       - name: Build main app
         run: idf.py build
 
-      # 4) Build Unit-Test App (solo componente 'main')
+      # 4) Build Unit-Test App (solo componente 'main') - BLE disabilitato per test
       - name: Build ut_app (component: main)
         run: |
           export EXTRA_COMPONENT_DIRS=${GITHUB_WORKSPACE}
           cd $IDF_PATH/tools/unit-test-app
+          # Disabilita BLE per i test Unity
+          echo "CONFIG_MAIN_WITH_BLE=n" >> sdkconfig.defaults
           idf.py -T main build
 
       # 5) artefatti (opzionale)
