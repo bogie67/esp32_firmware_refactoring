@@ -3,6 +3,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "error_manager.h"
 #include <string.h>
 #include <stdlib.h>
 #include "cmd_frame.h"

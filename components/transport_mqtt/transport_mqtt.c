@@ -1,4 +1,5 @@
 #include "transport_mqtt.h"
+#include "error_manager.h"
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_timer.h"
@@ -231,6 +232,20 @@ void transport_mqtt_init(QueueHandle_t cmdQueue, QueueHandle_t respQueue)
     cmd_queue = cmdQueue;
     resp_queue = respQueue;
     
+    // Registra componente nel framework error management unificato
+    esp_err_t err = error_manager_register_component(
+        ERROR_COMPONENT_MQTT_TRANSPORT,
+        NULL,  // Usa configurazione default
+        NULL,  // Nessun callback recovery personalizzato per ora
+        NULL   // Nessun user data
+    );
+    
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "⚠️ Failed to register with unified error manager: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "🎯 MQTT transport registered with unified error manager");
+    }
+    
     // Configurazione client MQTT
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker = {
@@ -262,9 +277,9 @@ void transport_mqtt_init(QueueHandle_t cmdQueue, QueueHandle_t respQueue)
         .callback = &reconnect_timer_callback,
         .name = "mqtt_reconn"
     };
-    esp_err_t err = esp_timer_create(&timer_args, &reconnect_timer);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "❌ Errore creazione timer riconnessione: %s", esp_err_to_name(err));
+    esp_err_t timer_err = esp_timer_create(&timer_args, &reconnect_timer);
+    if (timer_err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Errore creazione timer riconnessione: %s", esp_err_to_name(timer_err));
         return;
     }
     

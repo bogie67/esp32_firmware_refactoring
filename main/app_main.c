@@ -4,6 +4,7 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "error_manager.h"
 #include "cmd_frame.h"
 #include "resp_frame.h"
 #include "transport_ble.h"
@@ -106,6 +107,14 @@ static void wifi_stack_init(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting NimBLE demo");
+
+    // Inizializza framework error management unificato
+    esp_err_t err = error_manager_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ Failed to initialize error manager: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "🎯 Unified error management system initialized");
 
     // Inizializza NVS prima di WiFi
     esp_err_t ret = nvs_flash_init();

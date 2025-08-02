@@ -9,4 +9,5 @@ idf_component_register(
         esp_timer
         freertos
         protocol_types
+        error_manager
 )

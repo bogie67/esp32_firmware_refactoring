@@ -3,6 +3,7 @@
  * Compatibile con ESP-IDF v5.4
  */
 #include "transport_ble.h"
+#include "error_manager.h"
 #include "codec.h"
 #include "chunk_manager.h"
 #include "esp_log.h"
@@ -72,6 +73,9 @@ static const uint32_t RETRY_MAX_ATTEMPTS = 5;          // Max 5 retries
 static const uint32_t CIRCUIT_BREAKER_THRESHOLD = 10;  // 10 consecutive failures
 static const uint32_t CIRCUIT_BREAKER_TIMEOUT_MS = 5000; // 5 second recovery
 
+/* ──────────────── Error Handling System (UNIFIED) ──────────────── */
+// All error handling now managed by unified error_manager framework
+
 #if CONFIG_MAIN_WITH_BLE
 
 /* ──────────────── Forward declarations ──────────────── */
@@ -81,6 +85,12 @@ static void backpressure_reset(void);
 static bool backpressure_should_retry(void);
 static void backpressure_record_failure(void);
 static void backpressure_record_success(void);
+
+// Unified error management integration
+static error_category_t ble_error_to_unified_category(ble_error_type_t ble_error);
+static error_severity_t ble_error_to_unified_severity(ble_error_severity_t ble_severity);
+static void ble_error_report_unified(ble_error_type_t error_type, ble_error_severity_t severity, 
+                                    esp_err_t esp_code, const char *description);
 
 /* ──────────────── Back-off advertising helpers ──────────────── */
 
@@ -285,6 +295,8 @@ static esp_err_t send_chunk_with_backpressure(const uint8_t *chunk_data, size_t 
         struct os_mbuf *om = ble_hs_mbuf_from_flat(chunk_data, chunk_size);
         if (!om) {
             ESP_LOGE("BLE_NIMBLE", "❌ Failed to create mbuf for chunk %u/%u", chunk_idx + 1, total_chunks);
+            ble_error_report_unified(BLE_ERROR_MEMORY_EXHAUSTED, BLE_ERROR_SEVERITY_WARNING, 
+                           ESP_ERR_NO_MEM, "Failed to allocate mbuf for chunk transmission");
             backpressure_record_failure();
             attempts++;
             continue;
@@ -300,6 +312,8 @@ static esp_err_t send_chunk_with_backpressure(const uint8_t *chunk_data, size_t 
             ESP_LOGW("BLE_NIMBLE", "⚠️ Chunk %u/%u send failed: %d (attempt %d)", 
                      chunk_idx + 1, total_chunks, rc, attempts + 1);
             // mbuf is automatically freed by NimBLE on failure
+            ble_error_report_unified(BLE_ERROR_NOTIFICATION_FAILED, BLE_ERROR_SEVERITY_WARNING, 
+                           rc, "GATT notification send failed during chunked transmission");
             backpressure_record_failure();
             attempts++;
         }
@@ -406,6 +420,8 @@ static int gatt_chr_access_cb(uint16_t conn_h, uint16_t attr_h,
                     }
                 } else {
                     ESP_LOGE("BLE_NIMBLE", "❌ Chunk processing failed: %s", esp_err_to_name(err));
+                    ble_error_report_unified(BLE_ERROR_CHUNK_ASSEMBLY_FAILED, BLE_ERROR_SEVERITY_ERROR, 
+                                   err, "Chunk processing/reassembly failed");
                 }
                 
                 free(write_data);
@@ -421,6 +437,8 @@ static int gatt_chr_access_cb(uint16_t conn_h, uint16_t attr_h,
             xQueueSend(cmd_queue, &f, 0);
         } else {
             ESP_LOGW("BLE_NIMBLE", "❌ Failed to decode frame (len=%d)", om_len);
+            ble_error_report_unified(BLE_ERROR_INVALID_FRAME, BLE_ERROR_SEVERITY_WARNING, 
+                           ESP_ERR_INVALID_ARG, "Failed to decode received BLE frame");
         }
         
         free(write_data);
@@ -480,6 +498,11 @@ static int gap_evt_cb(struct ble_gap_event *ev, void *arg)
             ble_gattc_exchange_mtu(current_conn, NULL, NULL);
         } else {
             ESP_LOGW("BLE_NIMBLE", "❌ Connessione fallita: status=%d", ev->connect.status);
+            
+            // Report connection failure
+            ble_error_report_unified(BLE_ERROR_CONNECTION_FAILED, BLE_ERROR_SEVERITY_ERROR, 
+                           ev->connect.status, "BLE connection establishment failed");
+            
             ble_state = BLE_ADVERTISING;
             // Schedula re-advertising con back-off
             schedule_advertising_backoff();
@@ -488,6 +511,11 @@ static int gap_evt_cb(struct ble_gap_event *ev, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI("BLE_NIMBLE", "📱 Client disconnesso - reason=%d", ev->disconnect.reason);
+        
+        // Report connection lost error
+        ble_error_report_unified(BLE_ERROR_CONNECTION_LOST, BLE_ERROR_SEVERITY_WARNING, 
+                       ev->disconnect.reason, "BLE client disconnected unexpectedly");
+        
         current_conn = BLE_HS_CONN_HANDLE_NONE;
         negotiated_mtu = 23;  // Reset to default
         ble_state = BLE_ADVERTISING;
@@ -759,6 +787,143 @@ static void host_task(void *param)
 
 #endif /* CONFIG_MAIN_WITH_BLE */
 
+/* ──────────────── Error Handling Implementation ──────────────── */
+
+/**
+ * @brief Ottiene descrizione testuale per tipo errore
+ */
+const char* transport_ble_get_error_description(ble_error_type_t error_type)
+{
+    switch (error_type) {
+        case BLE_ERROR_NONE: return "No error";
+        case BLE_ERROR_CONNECTION_LOST: return "Connection lost unexpectedly";
+        case BLE_ERROR_CONNECTION_FAILED: return "Connection establishment failed";
+        case BLE_ERROR_CONNECTION_TIMEOUT: return "Connection timeout";
+        case BLE_ERROR_MTU_NEGOTIATION: return "MTU negotiation failed";
+        case BLE_ERROR_GATT_WRITE_FAILED: return "GATT write operation failed";
+        case BLE_ERROR_GATT_READ_FAILED: return "GATT read operation failed";
+        case BLE_ERROR_NOTIFICATION_FAILED: return "Notification send failed";
+        case BLE_ERROR_MEMORY_EXHAUSTED: return "Memory pool exhausted";
+        case BLE_ERROR_QUEUE_FULL: return "Command/response queue full";
+        case BLE_ERROR_RESOURCE_UNAVAILABLE: return "Resource unavailable";
+        case BLE_ERROR_CHUNK_ASSEMBLY_FAILED: return "Chunk assembly failed";
+        case BLE_ERROR_CHUNK_TIMEOUT: return "Chunk reassembly timeout";
+        case BLE_ERROR_INVALID_FRAME: return "Invalid frame received";
+        case BLE_ERROR_PROTOCOL_VIOLATION: return "Protocol violation";
+        case BLE_ERROR_STACK_FAULT: return "NimBLE stack fault";
+        case BLE_ERROR_HARDWARE_FAULT: return "Hardware radio fault";
+        case BLE_ERROR_CONFIGURATION_INVALID: return "Invalid configuration";
+        case BLE_ERROR_RECOVERY_FAILED: return "Automatic recovery failed";
+        case BLE_ERROR_RESTART_REQUIRED: return "System restart required";
+        default: return "Unknown error";
+    }
+}
+
+/* ──────────────── LEGACY FUNCTIONS REMOVED ──────────────── */
+/* All error handling now managed by unified error_manager framework */
+
+/* ──────────────── Unified Error Management Integration ──────────────── */
+
+/**
+ * @brief Mappa errori BLE alle categorie unificate
+ */
+static error_category_t ble_error_to_unified_category(ble_error_type_t ble_error)
+{
+    switch (ble_error) {
+        case BLE_ERROR_CONNECTION_LOST:
+        case BLE_ERROR_CONNECTION_FAILED:
+        case BLE_ERROR_CONNECTION_TIMEOUT:
+            return ERROR_CATEGORY_CONNECTION;
+            
+        case BLE_ERROR_MTU_NEGOTIATION:
+        case BLE_ERROR_GATT_WRITE_FAILED:
+        case BLE_ERROR_GATT_READ_FAILED:
+        case BLE_ERROR_NOTIFICATION_FAILED:
+            return ERROR_CATEGORY_COMMUNICATION;
+            
+        case BLE_ERROR_MEMORY_EXHAUSTED:
+            return ERROR_CATEGORY_MEMORY;
+            
+        case BLE_ERROR_QUEUE_FULL:
+            return ERROR_CATEGORY_QUEUE;
+            
+        case BLE_ERROR_RESOURCE_UNAVAILABLE:
+            return ERROR_CATEGORY_RESOURCE;
+            
+        case BLE_ERROR_CHUNK_ASSEMBLY_FAILED:
+        case BLE_ERROR_CHUNK_TIMEOUT:
+        case BLE_ERROR_INVALID_FRAME:
+        case BLE_ERROR_PROTOCOL_VIOLATION:
+            return ERROR_CATEGORY_PROTOCOL;
+            
+        case BLE_ERROR_STACK_FAULT:
+        case BLE_ERROR_HARDWARE_FAULT:
+            return ERROR_CATEGORY_HARDWARE;
+            
+        case BLE_ERROR_CONFIGURATION_INVALID:
+            return ERROR_CATEGORY_CONFIGURATION;
+            
+        case BLE_ERROR_RECOVERY_FAILED:
+        case BLE_ERROR_RESTART_REQUIRED:
+            return ERROR_CATEGORY_RECOVERY;
+            
+        case BLE_ERROR_NONE:
+        default:
+            return ERROR_CATEGORY_SYSTEM;
+    }
+}
+
+/**
+ * @brief Mappa severità BLE alle severità unificate
+ */
+static error_severity_t ble_error_to_unified_severity(ble_error_severity_t ble_severity)
+{
+    switch (ble_severity) {
+        case BLE_ERROR_SEVERITY_INFO:
+            return ERROR_SEVERITY_INFO;
+        case BLE_ERROR_SEVERITY_WARNING:
+            return ERROR_SEVERITY_WARNING;
+        case BLE_ERROR_SEVERITY_ERROR:
+            return ERROR_SEVERITY_ERROR;
+        case BLE_ERROR_SEVERITY_CRITICAL:
+            return ERROR_SEVERITY_CRITICAL;
+        default:
+            return ERROR_SEVERITY_ERROR;
+    }
+}
+
+/**
+ * @brief Report errore al framework unificato (versione pulita)
+ */
+static void ble_error_report_unified(ble_error_type_t error_type, ble_error_severity_t severity, 
+                                    esp_err_t esp_code, const char *description)
+{
+    // Mappa ai tipi unificati
+    error_category_t unified_category = ble_error_to_unified_category(error_type);
+    error_severity_t unified_severity = ble_error_to_unified_severity(severity);
+    
+    // Crea descrizione se non fornita
+    const char *final_description = description;
+    if (!final_description) {
+        final_description = transport_ble_get_error_description(error_type);
+    }
+    
+    // Report al framework unificato
+    esp_err_t result = error_manager_report(
+        ERROR_COMPONENT_BLE_TRANSPORT,
+        unified_category,
+        unified_severity,
+        (uint32_t)error_type,          // Codice errore specifico BLE
+        esp_code,                       // Codice ESP32 sottostante
+        (uint32_t)current_conn,        // Context data (connection handle)
+        final_description
+    );
+    
+    if (result != ESP_OK) {
+        ESP_LOGW("BLE_ERROR", "⚠️ Failed to report to unified error manager: %s", esp_err_to_name(result));
+    }
+}
+
 /* ──────────────── API pubblica ──────────────── */
 
 void transport_ble_init(QueueHandle_t cmdQueue, QueueHandle_t respQueue)
@@ -775,6 +940,20 @@ void transport_ble_init(QueueHandle_t cmdQueue, QueueHandle_t respQueue)
     ble_state = BLE_DOWN;
     current_conn = BLE_HS_CONN_HANDLE_NONE;
     negotiated_mtu = 23;
+    
+    // Registra componente nel framework error management unificato
+    esp_err_t err = error_manager_register_component(
+        ERROR_COMPONENT_BLE_TRANSPORT,
+        NULL,  // Usa configurazione default
+        NULL,  // Nessun callback recovery personalizzato per ora
+        NULL   // Nessun user data
+    );
+    
+    if (err != ESP_OK) {
+        ESP_LOGW("BLE_NIMBLE", "⚠️ Failed to register with unified error manager: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI("BLE_NIMBLE", "🎯 BLE transport registered with unified error manager");
+    }
     
     ESP_LOGI("BLE_NIMBLE", "✅ Transport BLE inizializzato");
 }
@@ -997,6 +1176,10 @@ esp_err_t transport_ble_get_connection_info(uint16_t *conn_handle,
     
     return ESP_OK;
 }
+
+/* ──────────────── Error Handling API (DEPRECATED - Use error_manager) ──────────────── */
+/* All error handling APIs now managed by unified error_manager framework */
+/* Use error_manager_* functions for new code */
 
 /* Legacy API - backward compatibility */
 void smart_ble_transport_init(QueueHandle_t cQ, QueueHandle_t rQ)
