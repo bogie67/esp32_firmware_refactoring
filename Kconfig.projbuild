@@ -1,0 +1,14 @@
+menu "Custom"
+    config SOLENOID_CH1_GPIO
+        int "Solenoid channel 1 GPIO"
+        default 26
+    config SOLENOID_CH2_GPIO
+        int "Solenoid channel 2 GPIO"
+        default 27
+    config SOLENOID_CH3_GPIO
+        int "Solenoid channel 3 GPIO"
+        default 14
+    config SOLENOID_CH4_GPIO
+        int "Solenoid channel 4 GPIO"
+        default 12
+endmenu

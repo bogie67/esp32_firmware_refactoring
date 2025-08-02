@@ -12,6 +12,8 @@
 #include "esp_event.h"
 #include "esp_wifi.h"
 
+#include "solenoid.h"
+
 
 static const char *TAG = "APP_MAIN";
 QueueHandle_t cmdQueue;
@@ -51,6 +53,7 @@ void app_main(void)
 
     wifi_stack_init();
     cmd_proc_start();
+    solenoid_init();
 
     smart_ble_transport_init(cmdQueue, respQueue);
 }

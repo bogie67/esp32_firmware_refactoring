@@ -1,0 +1,43 @@
+name: esp-idf build & unit-test (build-only)
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) clone
+      - uses: actions/checkout@v4
+
+      # 2) install ESP-IDF 5.4 toolchain
+      - name: Setup ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          target: esp32
+          path: .
+          command: true      # ← salta build qui, la facciamo nei passi successivi
+
+      # 3) Build firmware app normale
+      - name: Build main app
+        run: idf.py build
+
+      # 4) Build Unit-Test App (solo componente 'main')
+      - name: Build ut_app (component: main)
+        run: |
+          export EXTRA_COMPONENT_DIRS=${GITHUB_WORKSPACE}
+          cd $IDF_PATH/tools/unit-test-app
+          idf.py -T main build
+
+      # 5) artefatti (opzionale)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fw-and-tests
+          path: |
+            build/*.bin
+            build/*.elf
+            tools/unit-test-app/build/ut_app/*.elf

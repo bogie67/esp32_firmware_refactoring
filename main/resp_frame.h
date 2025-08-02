@@ -1,3 +1,4 @@
+
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
@@ -6,9 +7,9 @@
 
 typedef struct {
     uint16_t id;
-    int8_t   status;     /* 0=ok, <0=err code               */
-    uint8_t *payload;    /* può essere NULL                 */
-    size_t   len;        /* len del payload                 */
-    origin_t origin;     /* per sapere a chi rilanciare     */
-    bool     is_final;   /* ultimo pacchetto di uno stream  */
+    int8_t   status;     // 0 = ok, <0 = error code
+    uint8_t* payload;    // may be NULL
+    size_t   len;        // payload length
+    origin_t origin;
+    bool     is_final;   // last frame of stream
 } resp_frame_t;

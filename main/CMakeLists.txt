@@ -7,7 +7,8 @@ idf_component_register(
          "transport_ble.c"
          "transport_mqtt.c"
          "wifi.c"
+         "solenoid.c"
          "test_wifi_simple.c"
     INCLUDE_DIRS "."
-    REQUIRES bt esp_wifi json freertos nvs_flash unity
+    REQUIRES bt esp_wifi json freertos nvs_flash unity driver
 )
