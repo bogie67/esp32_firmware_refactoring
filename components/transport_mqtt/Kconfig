@@ -1,0 +1,49 @@
+menu "MQTT Transport Configuration"
+
+    config MQTT_BROKER_URI
+        string "MQTT broker URI"
+        default "mqtt://192.168.1.10"
+        help
+            URI of the MQTT broker to connect to.
+            Examples:
+            - mqtt://192.168.1.10 (plain MQTT)
+            - mqtts://broker.hivemq.com (secure MQTT)
+            - mqtt://user:pass@192.168.1.10 (with authentication)
+
+    config MQTT_BROKER_PORT
+        int "MQTT broker port" 
+        default 1883
+        help
+            Port number for MQTT broker connection.
+            Standard ports: 1883 (plain), 8883 (secure)
+
+    config MQTT_KEEPALIVE_INTERVAL
+        int "MQTT keepalive interval (seconds)"
+        default 60
+        range 10 300
+        help
+            MQTT keepalive interval in seconds
+
+    config MQTT_CMD_TOPIC
+        string "MQTT command topic"
+        default "smartdrip/cmd"
+        help
+            Topic for receiving commands via MQTT
+
+    config MQTT_RESP_TOPIC
+        string "MQTT response topic"
+        default "smartdrip/resp"
+        help
+            Topic for publishing responses via MQTT
+
+    config MQTT_QOS_LEVEL
+        int "MQTT QoS level"
+        default 1
+        range 0 2
+        help
+            Quality of Service level for MQTT messages:
+            0 = At most once
+            1 = At least once  
+            2 = Exactly once
+
+endmenu

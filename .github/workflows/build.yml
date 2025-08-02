@@ -2,41 +2,46 @@ name: esp-idf build & unit-test (build-only)
 
 on:
   push:
-    branches: ["*"]
+    branches:
+      - '**'          # qualunque branch
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
+
+env:
+  # Il path dei componenti che la Unit-Test App deve “vedere”
+  EXTRA_COMPONENT_DIRS: ${{ github.workspace }}/components
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) clone
-      - uses: actions/checkout@v4
+      # 1️⃣ Clona il repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      # 2) install ESP-IDF 5.4 toolchain
+      # 2️⃣ Installa toolchain ESP-IDF 5.4 (cache automatica)
       - name: Setup ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
         with:
           target: esp32
-          path: .
-          command: true      # ← salta build qui, la facciamo nei passi successivi
+          path: ${{ github.workspace }}
+          command: true        # nessun idf.py qui; lo faremo negli step dopo
 
-      # 3) Build firmware app normale
-      - name: Build main app
+      # 3️⃣ Build del firmware “normale”
+      - name: Build main firmware
         run: idf.py build
 
-      # 4) Build Unit-Test App (solo componente 'main') - BLE disabilitato per test
-      - name: Build ut_app (component: main)
+      # 4️⃣ Build della Unit-Test App con SOLO il componente 'main'
+      - name: Build Unit-Test App (main)
         run: |
-          export EXTRA_COMPONENT_DIRS=${GITHUB_WORKSPACE}
-          cd $IDF_PATH/tools/unit-test-app
-          # Disabilita BLE per i test Unity
-          echo "CONFIG_MAIN_WITH_BLE=n" >> sdkconfig.defaults
-          idf.py -T main build
+          cd "$IDF_PATH/tools/unit-test-app"
+          idf.py -T main -DSDKCONFIG_DEFAULTS=sdkconfig.defaults build
 
-      # 5) artefatti (opzionale)
-      - uses: actions/upload-artifact@v4
+      # 5️⃣ ( opzionale ) carica gli artefatti bin/elf
+      - name: Upload artefacts
+        uses: actions/upload-artifact@v4
         with:
           name: fw-and-tests
           path: |

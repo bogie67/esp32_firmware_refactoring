@@ -7,6 +7,7 @@
 #include "cmd_frame.h"
 #include "resp_frame.h"
 #include "transport_ble.h"
+#include "transport_mqtt.h"
 #include "cmd_proc.h"
 #include "esp_netif.h"
 #include "esp_event.h"
@@ -63,4 +64,8 @@ void app_main(void)
 #if CONFIG_MAIN_WITH_BLE
    smart_ble_transport_init(cmdQueue, respQueue);
 #endif
+
+    // Inizializza e avvia transport MQTT
+    transport_mqtt_init(cmdQueue, respQueue);
+    transport_mqtt_start();
 }

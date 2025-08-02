@@ -2,23 +2,38 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
-/* MQTT transport component per comunicazione cloud */
+/* MQTT transport component - API identica a transport_ble */
 
-/* Inizializza il client MQTT */
-int transport_mqtt_init(void);
+/**
+ * @brief Inizializza il transport MQTT con code di comando e risposta
+ * 
+ * @param cmdQueue Queue per ricevere comandi dal broker MQTT
+ * @param respQueue Queue per inviare risposte al broker MQTT
+ */
+void transport_mqtt_init(QueueHandle_t cmdQueue, QueueHandle_t respQueue);
 
-/* Connette al broker MQTT */
-int transport_mqtt_connect(const char *broker_url);
+/**
+ * @brief Avvia la connessione MQTT e subscription ai topic
+ */
+void transport_mqtt_start(void);
 
-/* Disconnette dal broker MQTT */
-void transport_mqtt_disconnect(void);
+/**
+ * @brief Ferma la connessione MQTT
+ */
+void transport_mqtt_stop(void);
 
-/* Pubblica un messaggio su un topic */
-int transport_mqtt_publish(const char *topic, const uint8_t *data, size_t len);
+/**
+ * @brief Ottieni stato connessione MQTT
+ * 
+ * @return true se connesso, false altrimenti
+ */
+bool transport_mqtt_is_connected(void);
 
-/* Subscribe a un topic */
-int transport_mqtt_subscribe(const char *topic);
-
-/* Cleanup risorse MQTT */
+/**
+ * @brief Cleanup risorse MQTT
+ */
 void transport_mqtt_cleanup(void);
